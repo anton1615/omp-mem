@@ -1,0 +1,40 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "omp-mem",
+  "owner": {
+    "name": "anton1615"
+  },
+  "metadata": {
+    "description": "Marketplace source for the omp-mem Claude-mem-compatible memory extension for Oh My Pi / OMP.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "omp-mem",
+      "source": "./",
+      "description": "Claude-mem-compatible replacement memory extension for OMP with SQLite-backed observations and memory_* tools.",
+      "version": "0.1.0",
+      "author": {
+        "name": "anton1615"
+      },
+      "homepage": "https://github.com/anton1615/omp-mem",
+      "repository": "https://github.com/anton1615/omp-mem",
+      "keywords": [
+        "omp",
+        "omp-extension",
+        "memory",
+        "claude-mem",
+        "sqlite",
+        "context",
+        "observations"
+      ],
+      "category": "productivity",
+      "tags": [
+        "memory",
+        "context",
+        "sqlite",
+        "claude-mem"
+      ]
+    }
+  ]
+}

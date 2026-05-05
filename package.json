@@ -1,0 +1,50 @@
+{
+  "name": "omp-mem",
+  "version": "0.1.0",
+  "description": "Claude-mem-compatible replacement memory extension for Oh My Pi / OMP.",
+  "private": true,
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "index.ts",
+    "src/**",
+    "test/**",
+    "tsconfig.json",
+    ".claude-plugin/marketplace.json",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "bun test ./test",
+    "typecheck": "bunx --package typescript tsc --noEmit",
+    "check": "bun run test && bun run typecheck"
+  },
+  "keywords": [
+    "omp-package",
+    "omp-extension",
+    "pi-extension",
+    "memory",
+    "claude-mem",
+    "sqlite",
+    "context",
+    "observations"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/anton1615/omp-mem.git"
+  },
+  "homepage": "https://github.com/anton1615/omp-mem#readme",
+  "bugs": {
+    "url": "https://github.com/anton1615/omp-mem/issues"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.2"
+  },
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}
+
