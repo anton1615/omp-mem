@@ -150,7 +150,7 @@ export function resolveOmpMemConfig(input: OmpMemConfigInput = {}): OmpMemConfig
     ai: {
       provider: optionalProvider(ai.provider, DEFAULT_OMP_MEM_CONFIG.ai.provider),
       model: normalizeModelReference(optionalString(ai.model) ?? DEFAULT_OMP_MEM_CONFIG.ai.model),
-      maxTokens: boundedInteger(ai.maxTokens, DEFAULT_OMP_MEM_CONFIG.ai.maxTokens, 1, 16_384),
+      maxTokens: positiveIntegerOrFallback(ai.maxTokens, DEFAULT_OMP_MEM_CONFIG.ai.maxTokens, 16_384),
       failOpen: optionalBoolean(ai.failOpen, DEFAULT_OMP_MEM_CONFIG.ai.failOpen),
     },
     context: {
@@ -167,7 +167,7 @@ export function resolveOmpMemConfig(input: OmpMemConfigInput = {}): OmpMemConfig
       maxObservations: boundedInteger(artifacts.maxObservations, DEFAULT_OMP_MEM_CONFIG.artifacts.maxObservations, 1, 500),
     },
     search: {
-      defaultLimit: boundedInteger(search.defaultLimit, DEFAULT_OMP_MEM_CONFIG.search.defaultLimit, 1, maxLimit),
+      defaultLimit: positiveIntegerOrFallback(search.defaultLimit, DEFAULT_OMP_MEM_CONFIG.search.defaultLimit, maxLimit),
       maxLimit,
     },
     redaction: {
@@ -273,6 +273,14 @@ function optionalNullableInteger(value: unknown, fallback: number | null, min: n
   if (value === null) return null;
   if (value === undefined) return fallback;
   return boundedInteger(value, fallback ?? min, min, max);
+}
+
+function positiveIntegerOrFallback(value: unknown, fallback: number, max: number): number {
+  const raw = typeof value === "string" ? Number(value) : value;
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 1) {
+    return Math.min(max, fallback);
+  }
+  return Math.min(max, Math.floor(raw));
 }
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {

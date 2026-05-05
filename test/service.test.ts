@@ -11,6 +11,7 @@ import {
   resolveMemoryDatabasePath,
   type ObservationRequest,
 } from "../src/service";
+import { resolveOmpMemConfig } from "../src/config";
 
 let tempRoot: string;
 const services: Array<{ close(): void }> = [];
@@ -157,23 +158,51 @@ test("context injection writes compatible memory artifacts", async () => {
   expect(formatMemoryGetResponse(await service.getObservations({ ids: [1] }))).toContain("Fixed JWT refresh failure");
 });
 
+test("context injection uses configured session summaries and full observation details", async () => {
+  const service = await createTrackedService({
+    memoryRoot: tempRoot,
+    now: () => 1_700_000_000,
+    config: resolveOmpMemConfig({ context: { observations: 5, sessions: 1, fullCount: 1 } }),
+  });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Investigate alpha" });
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-alpha", tool_response: "Alpha durable detail in src/alpha.ts" }));
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-beta", tool_response: "Beta durable detail in src/beta.ts" }));
+  await service.summarizeSession({ contentSessionId: "session-1", last_assistant_message: "Session summary: alpha remains important" });
+
+  const context = await service.injectContext({ project: "app", q: "Alpha" });
+
+  expect(context).toContain("## Recent session summaries");
+  expect(context).toContain("Session summary: alpha remains important");
+  expect(context).toContain("## Full memory details");
+  expect(context).toContain("Alpha durable detail in src/alpha.ts");
+});
+
 test("recordObservation prefers configured model extraction over heuristic fields", async () => {
   const service = await createTrackedService({
     memoryRoot: tempRoot,
     now: () => 1_700_000_000,
-    extractObservation: async () => ({
-      title: "AI extracted auth decision",
-      narrative: "AI says JWT refresh was fixed by rotating expired credentials.",
-      type: "decision",
-      facts: ["JWT refresh failure fixed"],
-      files: ["src/auth.ts"],
-      concepts: ["jwt", "refresh"],
-      confidence: "inferred",
-    }),
+    extractObservation: async request => {
+      expect(request.toolInputText).not.toContain("secret-input");
+      expect(request.toolResponseText).not.toContain("secret-response");
+      expect(request.toolInputText).toContain("[private redacted]");
+      expect(request.toolResponseText).toContain("[private redacted]");
+      return {
+        title: "AI extracted auth decision",
+        narrative: "AI says JWT refresh was fixed by rotating expired credentials.",
+        type: "decision",
+        facts: ["JWT refresh failure fixed"],
+        files: ["src/auth.ts"],
+        concepts: ["jwt", "refresh"],
+        confidence: "inferred",
+      };
+    },
   });
   await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Fix auth" });
 
-  const id = await service.recordObservation(makeObservation());
+  const id = await service.recordObservation(makeObservation({
+    tool_input: { command: "<private>secret-input</private> bun test auth.test.ts" },
+    tool_response: "Fixed JWT refresh failure in src/auth.ts <private>secret-response</private>",
+  }));
   const observation = (await service.getObservations({ ids: [id] })).observations[0];
 
   expect(observation?.title).toBe("AI extracted auth decision");
@@ -183,6 +212,59 @@ test("recordObservation prefers configured model extraction over heuristic field
   expect(observation?.files).toEqual(["src/auth.ts"]);
   expect(observation?.concepts).toEqual(["jwt", "refresh"]);
   expect(observation?.confidence).toBe("inferred");
+});
+
+test("recordObservation redacts extracted files and concepts", async () => {
+  const service = await createTrackedService({
+    memoryRoot: tempRoot,
+    now: () => 1_700_000_000,
+    extractObservation: async () => ({
+      title: "Safe title",
+      narrative: "Safe narrative",
+      files: ["src/auth.ts", "<private>secret/path.ts</private>"],
+      concepts: ["auth", "<private>secret concept</private>"],
+      facts: ["safe fact"],
+    }),
+  });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Fix auth" });
+
+  const id = await service.recordObservation(makeObservation());
+  const observation = (await service.getObservations({ ids: [id] })).observations[0];
+
+  expect(observation?.files.join(" ")).not.toContain("secret");
+  expect(observation?.concepts.join(" ")).not.toContain("secret");
+});
+
+test("summarizeSession accepts injected summary without raw assistant text", async () => {
+  const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Fix auth" });
+
+  await service.summarizeSession({ contentSessionId: "session-1", summary: "Injected session summary." });
+
+  const row = service.db.prepare("SELECT summary FROM session_summaries WHERE content_session_id = ?").get("session-1") as { summary: string } | undefined;
+  expect(row?.summary).toBe("Injected session summary.");
+});
+
+test("flushArtifacts honors artifact max above public search cap", async () => {
+  const service = await createTrackedService({
+    memoryRoot: tempRoot,
+    now: (() => {
+      let current = 1_700_000_000;
+      return () => current++;
+    })(),
+    config: resolveOmpMemConfig({ search: { maxLimit: 1 }, artifacts: { maxObservations: 3 } }),
+  });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Work" });
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-1", tool_response: "First artifact detail" }));
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-2", tool_response: "Second artifact detail" }));
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-3", tool_response: "Third artifact detail" }));
+
+  await service.flushArtifacts("app");
+
+  const full = await fs.readFile(path.join(tempRoot, "MEMORY.md"), "utf8");
+  expect(full).toContain("First artifact detail");
+  expect(full).toContain("Second artifact detail");
+  expect(full).toContain("Third artifact detail");
 });
 
 test("summarizeSession uses configured model summary and falls back safely", async () => {

@@ -109,3 +109,12 @@ test("normalizes unsafe scalar config values back to defaults", () => {
   expect(config.search.defaultLimit).toBe(DEFAULT_OMP_MEM_CONFIG.search.defaultLimit);
   expect(config.search.maxLimit).toBe(200);
 });
+
+test("clamps fallback search default to configured max limit", () => {
+  const config = resolveOmpMemConfig({
+    search: { defaultLimit: 0, maxLimit: 5 },
+  });
+
+  expect(config.search.defaultLimit).toBe(5);
+  expect(config.search.maxLimit).toBe(5);
+});

@@ -14,9 +14,75 @@ Claude-mem-compatible replacement memory extension for Oh My Pi / OMP.
   - `memory_summary.md`
   - `MEMORY.md`
 - Stores project memory in SQLite at:
-  - `~/.omp/agent/omp-mem/state/<encoded-project-path>/omp-mem.sqlite`
+  - `~/.omp/agent/omp-mem/state/<encoded-project-path>/omp-mem.sqlite` by default; set `ompMem.dataDir` to move this root
 
 Private spans wrapped in `<private>...</private>` are stripped before observations are stored.
+
+## Configuration
+
+`omp-mem` reads user-facing config from the `ompMem:` block in `~/.omp/agent/config.yml`. If that block is absent, it can also read a plugin-owned compatibility file at `~/.omp/agent/omp-mem/settings.json` with common `CLAUDE_MEM_*` flat keys.
+
+Example:
+
+```yml
+ompMem:
+  enabled: true
+  dataDir: auto
+  mode: code
+  ai:
+    provider: omp        # "omp" uses OMP's model registry; "heuristic" disables model calls
+    model: current       # current, canonical ID, or provider/model-id
+    maxTokens: 1024
+    failOpen: true       # fall back to heuristic extraction if the model call fails
+  capture:
+    prompts: true
+    tools: true
+    agentEnd: true
+    sessionCompact: true
+    skipTools:
+      - memory_search
+      - memory_timeline
+      - memory_get_observations
+      - todo_write
+      - ask
+  context:
+    enabled: true
+    observations: 50
+    sessions: 10
+    fullCount: 5
+    includeSummary: true
+  artifacts:
+    enabled: true
+    writeSummary: true
+    writeMemoryMd: true
+    maxObservations: 50
+  search:
+    defaultLimit: 20
+    maxLimit: 100
+  redaction:
+    privateTag: true
+```
+
+### Model-based compression
+
+With `ai.provider: omp`, the extension can use an OMP model to extract durable observations and summarize session-end assistant output. It resolves the configured model from the active OMP context/model registry, obtains the provider API key through `ctx.modelRegistry.getApiKey(...)`, and calls `@oh-my-pi/pi-ai` for a compact JSON observation or markdown session summary.
+
+If no model/API key is available or the model call fails while `failOpen: true`, `omp-mem` stores a deterministic heuristic observation instead of blocking the agent turn.
+
+Supported `~/.omp/agent/omp-mem/settings.json` compatibility aliases include:
+
+```json
+{
+  "CLAUDE_MEM_MODEL": "google/gemini-2.5-flash",
+  "CLAUDE_MEM_MODE": "code",
+  "CLAUDE_MEM_CONTEXT_OBSERVATIONS": "50",
+  "CLAUDE_MEM_CONTEXT_SESSION_COUNT": "10",
+  "CLAUDE_MEM_CONTEXT_FULL_COUNT": "5",
+  "CLAUDE_MEM_SKIP_TOOLS": "memory_search,memory_timeline,memory_get_observations"
+}
+```
+
+Provider selection is OMP-native: use an OMP model reference (`current`, canonical ID, or `provider/model-id`) rather than Claude Code's original `CLAUDE_MEM_PROVIDER` worker setting.
 
 ## Tools
 

@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import {
   createMemoryService,
   formatMemoryGetResponse,
@@ -7,12 +8,27 @@ import {
   type GetObservationsRequest,
   type MemoryService,
   type MemoryServiceOptions,
+  type ObservationExtractionRequest,
+  type ObservationExtractionResult,
   type SearchRequest,
+  type SessionSummaryRequest,
   type TimelineRequest,
 } from "./service";
+import { loadOmpMemConfigFromHome, resolveDataDir, type OmpMemConfig } from "./config";
+
+export interface OmpMemModelRequest {
+  kind: "observation" | "session-summary";
+  model: ModelLike;
+  apiKey: string;
+  prompt: string;
+  maxTokens: number;
+  ctx: ExtensionContext;
+}
 
 export interface OmpMemExtensionOptions extends Partial<MemoryServiceOptions> {
   homeDir?: string;
+  config?: OmpMemConfig;
+  completeText?: (request: OmpMemModelRequest) => Promise<string>;
 }
 
 interface ExtensionAPI {
@@ -40,6 +56,19 @@ interface ExtensionAPI {
   ): void;
 }
 
+interface ModelLike {
+  provider: string;
+  id: string;
+  name?: string;
+  api?: string;
+}
+
+interface ModelRegistryLike {
+  getApiKey(model: unknown, sessionId?: string): Promise<string | undefined>;
+  find?(provider: string, modelId: string): unknown;
+  resolveCanonicalModel?(canonicalId: string, options?: { availableOnly?: boolean }): unknown;
+  getAvailable?(): unknown[];
+}
 interface ExtensionContext {
   cwd?: string;
   ui?: {
@@ -49,6 +78,8 @@ interface ExtensionContext {
     getSessionId(): string;
     getSessionName?(): string | undefined;
   };
+  model?: ModelLike;
+  modelRegistry?: ModelRegistryLike;
 }
 
 interface ToolDefinition {
@@ -67,22 +98,32 @@ interface ToolDefinition {
 
 const SELF_TOOL_NAMES = new Set(["memory_search", "memory_timeline", "memory_get_observations"]);
 
-export default function ompMemExtension(pi: ExtensionAPI): void {
-  void registerOmpMemExtension(pi);
+export default async function ompMemExtension(pi: ExtensionAPI): Promise<void> {
+  await registerOmpMemExtension(pi);
 }
 
 export async function registerOmpMemExtension(pi: ExtensionAPI, options: OmpMemExtensionOptions = {}): Promise<void> {
+  const config = options.config ?? await loadOmpMemConfigFromHome(options.homeDir);
+  if (!config.enabled) {
+    pi.logger?.debug?.("omp-mem disabled by config");
+    return;
+  }
+
   const services = new Map<string, Promise<MemoryService>>();
   const capturedToolCallIds = new Set<string>();
   const getService = async (ctx?: ExtensionContext): Promise<MemoryService> => {
     const cwd = ctx?.cwd ?? process.cwd();
-    const memoryRoot = options.memoryRoot ?? resolveMemoryRoot({ cwd, homeDir: options.homeDir });
+    const dataDir = resolveDataDir(options.homeDir ?? os.homedir(), config.dataDir);
+    const memoryRoot = options.memoryRoot ?? resolveMemoryRoot({ cwd, homeDir: options.homeDir, dataDir });
     const existing = services.get(memoryRoot);
     if (existing) return existing;
     const created = createMemoryService({
       memoryRoot,
       dbPath: options.dbPath,
       now: options.now,
+      config,
+      extractObservation: options.extractObservation,
+      summarizeText: options.summarizeText,
     });
     services.set(memoryRoot, created);
     return created;
@@ -103,13 +144,13 @@ export async function registerOmpMemExtension(pi: ExtensionAPI, options: OmpMemE
     await service.initSession({
       contentSessionId,
       project,
-      prompt,
+      prompt: config.capture.prompts ? prompt : "",
       platformSource: "omp",
       customTitle: ctx.sessionManager?.getSessionName?.(),
     });
-    const memoryContext = await service.injectContext({ project, q: prompt, limit: 5 });
+    const memoryContext = await service.injectContext({ project, q: prompt, limit: config.context.observations });
     const systemPrompt = typeof event.systemPrompt === "string" ? event.systemPrompt : "";
-    return { systemPrompt: `${systemPrompt}\n\n${memoryContext}`.trim() };
+    return memoryContext ? { systemPrompt: `${systemPrompt}\n\n${memoryContext}`.trim() } : { systemPrompt };
   });
 
   const recordToolEvent = async (
@@ -119,7 +160,8 @@ export async function registerOmpMemExtension(pi: ExtensionAPI, options: OmpMemE
     toolResponse: unknown,
   ) => {
     const toolName = typeof event.toolName === "string" ? event.toolName : "unknown";
-    if (SELF_TOOL_NAMES.has(toolName)) return;
+    if (!config.capture.tools) return;
+    if (SELF_TOOL_NAMES.has(toolName) || config.capture.skipTools.includes(toolName)) return;
     const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
     if (toolCallId && capturedToolCallIds.has(toolCallId)) return;
     if (toolCallId) {
@@ -127,14 +169,29 @@ export async function registerOmpMemExtension(pi: ExtensionAPI, options: OmpMemE
       capturedToolCallIds.add(toolCallId);
     }
     const service = await getService(ctx);
+    const contentSessionId = getContentSessionId(ctx);
+    const project = getProjectName(ctx);
+    const platformSource = "omp";
+    const extraction = await extractObservationWithModel(ctx, config, {
+      contentSessionId,
+      project,
+      toolName,
+      toolInput,
+      toolResponse,
+      cwd: ctx.cwd,
+      platformSource,
+      completeText: options.completeText,
+      logger: pi.logger,
+    });
     await service.recordObservation({
-      contentSessionId: getContentSessionId(ctx),
+      contentSessionId,
       tool_name: toolName,
       tool_input: toolInput,
       tool_response: toolResponse,
       cwd: ctx.cwd,
-      platformSource: "omp",
+      platformSource,
       tool_use_id: toolCallId,
+      extraction,
     });
     await service.flushArtifacts(getProjectName(ctx));
   };
@@ -157,25 +214,56 @@ export async function registerOmpMemExtension(pi: ExtensionAPI, options: OmpMemE
   });
 
   pi.on("agent_end", async (event, ctx) => {
+    if (!config.capture.agentEnd) return;
     const service = await getService(ctx);
+    const contentSessionId = getContentSessionId(ctx);
+    const project = getProjectName(ctx);
+    const lastAssistantMessage = extractAgentEndText(event.messages);
+    const summary = await summarizeSessionWithModel(ctx, config, {
+      contentSessionId,
+      project,
+      lastAssistantMessage,
+      platformSource: "omp",
+      completeText: options.completeText,
+      logger: pi.logger,
+    });
     await service.summarizeSession({
-      contentSessionId: getContentSessionId(ctx),
-      last_assistant_message: extractAgentEndText(event.messages),
+      contentSessionId,
+      last_assistant_message: lastAssistantMessage,
+      summary,
       platformSource: "omp",
     });
   });
 
   pi.on("session_compact", async (event, ctx) => {
+    if (!config.capture.sessionCompact) return;
     const service = await getService(ctx);
-    await service.recordObservation({
-      contentSessionId: getContentSessionId(ctx),
-      tool_name: "session_compact",
-      tool_input: { fromExtension: event.fromExtension },
-      tool_response: event.compactionEntry,
+    const contentSessionId = getContentSessionId(ctx);
+    const project = getProjectName(ctx);
+    const platformSource = "omp";
+    const toolInput = { fromExtension: event.fromExtension };
+    const toolResponse = event.compactionEntry;
+    const extraction = await extractObservationWithModel(ctx, config, {
+      contentSessionId,
+      project,
+      toolName: "session_compact",
+      toolInput,
+      toolResponse,
       cwd: ctx.cwd,
-      platformSource: "omp",
+      platformSource,
+      completeText: options.completeText,
+      logger: pi.logger,
     });
-    await service.flushArtifacts(getProjectName(ctx));
+    await service.recordObservation({
+      contentSessionId,
+      tool_name: "session_compact",
+      tool_input: toolInput,
+      tool_response: toolResponse,
+      cwd: ctx.cwd,
+      platformSource,
+      extraction,
+    });
+    await service.flushArtifacts(project);
   });
 }
 
@@ -267,6 +355,215 @@ function registerMemoryCommand(pi: ExtensionAPI, getService: (ctx?: ExtensionCon
       ctx.ui?.notify?.("Usage: /mem <status|flush|rebuild>", "warning");
     },
   });
+}
+
+interface ModelExtractionOptions extends Omit<ObservationExtractionRequest, "toolInputText" | "toolResponseText" | "combinedText"> {
+  toolInput: unknown;
+  toolResponse: unknown;
+  completeText?: (request: OmpMemModelRequest) => Promise<string>;
+  logger?: ExtensionAPI["logger"];
+}
+
+interface ModelSessionSummaryOptions extends SessionSummaryRequest {
+  completeText?: (request: OmpMemModelRequest) => Promise<string>;
+  logger?: ExtensionAPI["logger"];
+}
+
+async function extractObservationWithModel(
+  ctx: ExtensionContext,
+  config: OmpMemConfig,
+  options: ModelExtractionOptions,
+): Promise<ObservationExtractionResult | undefined> {
+  if (config.ai.provider !== "omp") return undefined;
+  const toolInputText = clampModelText(redactForModel(unknownToText(options.toolInput), config));
+  const toolResponseText = clampModelText(redactForModel(unknownToText(options.toolResponse), config));
+  const combinedText = [toolInputText, toolResponseText].filter(Boolean).join("\n");
+  const prompt = buildObservationExtractionPrompt({
+    contentSessionId: options.contentSessionId,
+    project: options.project,
+    toolName: options.toolName,
+    toolInputText,
+    toolResponseText,
+    combinedText,
+    cwd: options.cwd,
+    platformSource: options.platformSource,
+  });
+  const text = await completeModelText(ctx, config, "observation", prompt, options.completeText, options.logger);
+  return text ? parseObservationExtraction(text) : undefined;
+}
+
+async function summarizeSessionWithModel(
+  ctx: ExtensionContext,
+  config: OmpMemConfig,
+  options: ModelSessionSummaryOptions,
+): Promise<string | undefined> {
+  const lastAssistantMessage = clampModelText(redactForModel(options.lastAssistantMessage, config).trim());
+  if (config.ai.provider !== "omp" || !lastAssistantMessage) return undefined;
+  const prompt = `You are omp-mem, a claude-mem-compatible memory worker. Summarize the last assistant response for future memory. Keep only durable facts, decisions, changed files, open blockers, and next steps. Return plain markdown, no preamble.\n\n<assistant_response>\n${lastAssistantMessage}\n</assistant_response>`;
+  return completeModelText(ctx, config, "session-summary", prompt, options.completeText, options.logger);
+}
+
+async function completeModelText(
+  ctx: ExtensionContext,
+  config: OmpMemConfig,
+  kind: OmpMemModelRequest["kind"],
+  prompt: string,
+  injectedCompleteText: ((request: OmpMemModelRequest) => Promise<string>) | undefined,
+  logger: ExtensionAPI["logger"] | undefined,
+): Promise<string | undefined> {
+  const model = selectModel(ctx, config.ai.model);
+  if (!model) {
+    return handleModelExtractionUnavailable(config, logger, "model not available", { model: config.ai.model, kind });
+  }
+  try {
+    const apiKey = await ctx.modelRegistry?.getApiKey(model, getContentSessionId(ctx));
+    if (!apiKey) {
+      return handleModelExtractionUnavailable(config, logger, "API key not available", { provider: model.provider, model: model.id, kind });
+    }
+    return await (injectedCompleteText ?? defaultCompleteText)({ kind, model, apiKey, prompt, maxTokens: config.ai.maxTokens, ctx });
+  } catch (error) {
+    if (!config.ai.failOpen) throw error;
+    logger?.warn?.("omp-mem model extraction failed; falling back to heuristic memory", {
+      kind,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
+}
+
+async function defaultCompleteText(request: OmpMemModelRequest): Promise<string> {
+  type CompletionResponse = { content: Array<{ type: string; text?: string }> };
+  type PiAiModule = {
+    complete(
+      model: unknown,
+      context: { messages: Array<{ role: "user" | "assistant" | "system"; content: Array<{ type: "text"; text: string }>; timestamp?: number }> },
+      options: { apiKey?: string; maxTokens?: number; signal?: AbortSignal },
+    ): Promise<CompletionResponse>;
+  };
+  const importModule = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<PiAiModule>;
+  const ai = await importModule("@oh-my-pi/pi-ai");
+  const response = await ai.complete(
+    request.model,
+    {
+      messages: [
+        {
+          role: "user" as const,
+          content: [{ type: "text" as const, text: request.prompt }],
+          timestamp: Date.now(),
+        },
+      ],
+    },
+    { apiKey: request.apiKey, maxTokens: request.maxTokens },
+  );
+  return response.content
+    .filter((item): item is { type: string; text: string } => item.type === "text" && typeof item.text === "string")
+    .map(item => item.text)
+    .join("\n")
+    .trim();
+}
+
+function handleModelExtractionUnavailable(
+  config: OmpMemConfig,
+  logger: ExtensionAPI["logger"] | undefined,
+  message: string,
+  details: Record<string, unknown>,
+): undefined {
+  if (!config.ai.failOpen) throw new Error(message);
+  logger?.warn?.(`omp-mem model extraction skipped: ${message}`, details);
+  return undefined;
+}
+
+function selectModel(ctx: ExtensionContext, configuredModel: string): ModelLike | undefined {
+  if (configuredModel === "current") return ctx.model;
+  const registry = ctx.modelRegistry;
+  if (!registry) return undefined;
+
+  const canonical = asModelLike(registry.resolveCanonicalModel?.(configuredModel, { availableOnly: true }));
+  if (canonical) return canonical;
+
+  const slashIndex = configuredModel.indexOf("/");
+  if (slashIndex > 0) {
+    const provider = configuredModel.slice(0, slashIndex);
+    const rawModelId = configuredModel.slice(slashIndex + 1);
+    const exact = asModelLike(registry.find?.(provider, rawModelId));
+    if (exact) return exact;
+    const stripped = stripThinkingSuffix(rawModelId);
+    if (stripped !== rawModelId) return asModelLike(registry.find?.(provider, stripped));
+  }
+
+  return registry.getAvailable?.().map(asModelLike).filter((model): model is ModelLike => Boolean(model)).find(model => model.id === configuredModel || `${model.provider}/${model.id}` === configuredModel);
+}
+
+function clampModelText(text: string): string {
+  return text.length > 8_000 ? text.slice(0, 8_000) : text;
+}
+
+const PRIVATE_TAG_PATTERN = /<private>[\s\S]*?<\/private>/gi;
+
+function redactForModel(text: string, config: OmpMemConfig): string {
+  return config.redaction.privateTag ? text.replace(PRIVATE_TAG_PATTERN, "[private redacted]") : text;
+}
+
+function asModelLike(value: unknown): ModelLike | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  return typeof record.provider === "string" && typeof record.id === "string" ? (record as unknown as ModelLike) : undefined;
+}
+
+function stripThinkingSuffix(modelId: string): string {
+  const separator = modelId.lastIndexOf(":");
+  if (separator === -1) return modelId;
+  const suffix = modelId.slice(separator + 1).toLowerCase();
+  return suffix === "off" || suffix === "none" || suffix === "minimal" || suffix === "low" || suffix === "medium" || suffix === "high" || suffix === "xhigh"
+    ? modelId.slice(0, separator)
+    : modelId;
+}
+
+function buildObservationExtractionPrompt(request: ObservationExtractionRequest): string {
+  return `You are omp-mem, a claude-mem-compatible memory extraction worker. Extract one durable memory observation from this OMP tool event. Ignore transient noise, progress chatter, and secrets. Return strict JSON only with this shape: {"title":"short title","narrative":"concise but useful detail","type":"bugfix|feature|decision|discovery|refactor|change|preference","facts":["durable fact"],"files":["path"],"concepts":["keyword"],"confidence":"observed|inferred"}.\n\n<context>\ncontentSessionId: ${request.contentSessionId}\nproject: ${request.project}\nplatformSource: ${request.platformSource}\ncwd: ${request.cwd ?? ""}\ntoolName: ${request.toolName}\n</context>\n\n<tool_input>\n${request.toolInputText}\n</tool_input>\n\n<tool_response>\n${request.toolResponseText}\n</tool_response>`;
+}
+
+function parseObservationExtraction(text: string): ObservationExtractionResult | undefined {
+  const json = extractJsonObject(text);
+  if (!json) return undefined;
+  try {
+    const parsed = JSON.parse(json) as Record<string, unknown>;
+    return {
+      title: typeof parsed.title === "string" ? parsed.title : undefined,
+      narrative: typeof parsed.narrative === "string" ? parsed.narrative : undefined,
+      type: typeof parsed.type === "string" ? parsed.type : undefined,
+      facts: arrayOfStrings(parsed.facts),
+      files: arrayOfStrings(parsed.files),
+      concepts: arrayOfStrings(parsed.concepts),
+      confidence: typeof parsed.confidence === "string" ? parsed.confidence : undefined,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function extractJsonObject(text: string): string | undefined {
+  const trimmed = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  return start >= 0 && end > start ? trimmed.slice(start, end + 1) : undefined;
+}
+
+function arrayOfStrings(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const result = value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+  return result.length > 0 ? result : undefined;
+}
+
+function unknownToText(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }
 
 function getContentSessionId(ctx: ExtensionContext): string {

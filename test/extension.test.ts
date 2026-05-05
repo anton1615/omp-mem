@@ -70,18 +70,20 @@ function createFakeApi() {
   };
 }
 
-function createContext(): FakeContext {
+function createContext(withModel = false): FakeContext {
   return {
     cwd: "/repo/app",
     sessionManager: {
       getSessionId: () => "session-1",
       getSessionName: () => "app-session",
     },
-    model: { provider: "test", id: "model", name: "Test Model", api: "openai-responses" },
-    modelRegistry: {
-      getApiKey: async () => "test-api-key",
-      getAvailable: () => [],
-    },
+    ...(withModel ? {
+      model: { provider: "test", id: "model", name: "Test Model", api: "openai-responses" },
+      modelRegistry: {
+        getApiKey: async () => "test-api-key",
+        getAvailable: () => [],
+      },
+    } : {}),
   };
 }
 
@@ -158,7 +160,7 @@ test("deduplicates tool_execution_end and tool_result for the same tool call", a
 
 test("uses configured OMP model extraction for captured tool observations", async () => {
   const fake = createFakeApi();
-  const ctx = createContext();
+  const ctx = createContext(true);
   await registerOmpMemExtension(fake.api, {
     memoryRoot: tempRoot,
     dbPath: ":memory:",
@@ -191,6 +193,189 @@ test("uses configured OMP model extraction for captured tool observations", asyn
 
   expect(details?.content[0]?.text).toContain("Model extracted hook observation");
   expect(details?.content[0]?.text).toContain("model extraction ran");
+});
+
+test("redacts private spans before model extraction", async () => {
+  const fake = createFakeApi();
+  const ctx = createContext(true);
+  const prompts: string[] = [];
+  await registerOmpMemExtension(fake.api, {
+    memoryRoot: tempRoot,
+    dbPath: ":memory:",
+    now: () => 1_700_000_000,
+    config: resolveOmpMemConfig({ ai: { provider: "omp", model: "current" } }),
+    completeText: async request => {
+      prompts.push(request.prompt);
+      return request.kind === "session-summary"
+        ? "Safe session summary"
+        : JSON.stringify({
+          title: "Redacted observation",
+          narrative: "Only public details were sent to the model.",
+        });
+    },
+  });
+
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Check redaction", systemPrompt: "base" }, ctx);
+  await fake.handlers.get("tool_execution_end")?.[0]?.({
+    type: "tool_execution_end",
+    toolCallId: "tool-private",
+    toolName: "bash",
+    result: "public output\n<private>secret token</private>",
+    isError: false,
+  }, ctx);
+
+  await fake.handlers.get("agent_end")?.[0]?.({
+    type: "agent_end",
+    messages: [{ content: "Final <private>secret token</private> response" }],
+  }, ctx);
+
+  expect(prompts).toHaveLength(2);
+  for (const prompt of prompts) {
+    expect(prompt).toContain("[private redacted]");
+    expect(prompt).not.toContain("secret token");
+  }
+});
+
+test("clamps tool output before model extraction prompt", async () => {
+  const fake = createFakeApi();
+  const ctx = createContext(true);
+  let prompt = "";
+  await registerOmpMemExtension(fake.api, {
+    memoryRoot: tempRoot,
+    dbPath: ":memory:",
+    now: () => 1_700_000_000,
+    config: resolveOmpMemConfig({ ai: { provider: "omp", model: "current" } }),
+    completeText: async request => {
+      prompt = request.prompt;
+      return JSON.stringify({ title: "Clamped observation", narrative: "The prompt was bounded." });
+    },
+  });
+
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Clamp", systemPrompt: "base" }, ctx);
+  await fake.handlers.get("tool_execution_end")?.[0]?.({
+    type: "tool_execution_end",
+    toolCallId: "tool-large",
+    toolName: "bash",
+    result: `${"x".repeat(9_000)}TAIL_MARKER`,
+    isError: false,
+  }, ctx);
+
+  expect(prompt).not.toContain("TAIL_MARKER");
+});
+
+test("clamps session summary before model prompt", async () => {
+  const fake = createFakeApi();
+  const ctx = createContext(true);
+  let prompt = "";
+  await registerOmpMemExtension(fake.api, {
+    memoryRoot: tempRoot,
+    dbPath: ":memory:",
+    now: () => 1_700_000_000,
+    config: resolveOmpMemConfig({ ai: { provider: "omp", model: "current" } }),
+    completeText: async request => {
+      if (request.kind === "session-summary") prompt = request.prompt;
+      return request.kind === "session-summary"
+        ? "Clamped summary"
+        : JSON.stringify({ title: "Observation", narrative: "Observation" });
+    },
+  });
+
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Clamp summary", systemPrompt: "base" }, ctx);
+  await fake.handlers.get("agent_end")?.[0]?.({
+    type: "agent_end",
+    messages: [{ content: `${"x".repeat(9_000)}TAIL_MARKER` }],
+  }, ctx);
+
+  expect(prompt).not.toContain("TAIL_MARKER");
+});
+
+test("falls back when model API key lookup fails open", async () => {
+  const fake = createFakeApi();
+  const ctx = createContext(true);
+  ctx.modelRegistry = {
+    getApiKey: async () => { throw new Error("missing key"); },
+    getAvailable: () => [],
+  };
+  await registerOmpMemExtension(fake.api, {
+    memoryRoot: tempRoot,
+    dbPath: ":memory:",
+    now: () => 1_700_000_000,
+    config: resolveOmpMemConfig({ ai: { provider: "omp", model: "current", failOpen: true } }),
+    completeText: async () => {
+      throw new Error("should not call completion without API key");
+    },
+  });
+
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Fallback", systemPrompt: "base" }, ctx);
+  await fake.handlers.get("tool_execution_end")?.[0]?.({
+    type: "tool_execution_end",
+    toolCallId: "tool-fallback",
+    toolName: "bash",
+    result: "heuristic fallback output",
+    isError: false,
+  }, ctx);
+
+  const details = await fake.tools.get("memory_get_observations")?.execute("call-fallback", { ids: [1] }, undefined, ctx);
+
+  expect(details?.content[0]?.text).toContain("heuristic fallback output");
+});
+
+test("throws when model lookup fails closed", async () => {
+  const fake = createFakeApi();
+  const ctx = createContext();
+  await registerOmpMemExtension(fake.api, {
+    memoryRoot: tempRoot,
+    dbPath: ":memory:",
+    now: () => 1_700_000_000,
+    config: resolveOmpMemConfig({ ai: { provider: "omp", model: "current", failOpen: false } }),
+  });
+
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Fail closed", systemPrompt: "base" }, ctx);
+  let message = "";
+  try {
+    await fake.handlers.get("tool_execution_end")?.[0]?.({
+      type: "tool_execution_end",
+      toolCallId: "tool-fail-closed-model",
+      toolName: "bash",
+      result: "must not silently fallback",
+      isError: false,
+    }, ctx);
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+
+  expect(message).toContain("model not available");
+});
+
+test("throws when API key lookup returns empty and failOpen is false", async () => {
+  const fake = createFakeApi();
+  const ctx = createContext(true);
+  ctx.modelRegistry = {
+    getApiKey: async () => undefined,
+    getAvailable: () => [],
+  };
+  await registerOmpMemExtension(fake.api, {
+    memoryRoot: tempRoot,
+    dbPath: ":memory:",
+    now: () => 1_700_000_000,
+    config: resolveOmpMemConfig({ ai: { provider: "omp", model: "current", failOpen: false } }),
+  });
+
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Fail closed key", systemPrompt: "base" }, ctx);
+  let message = "";
+  try {
+    await fake.handlers.get("tool_execution_end")?.[0]?.({
+      type: "tool_execution_end",
+      toolCallId: "tool-fail-closed-key",
+      toolName: "bash",
+      result: "must not silently fallback",
+      isError: false,
+    }, ctx);
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+
+  expect(message).toContain("API key not available");
 });
 
 test("respects configured skipped tools", async () => {

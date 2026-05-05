@@ -17,6 +17,14 @@ declare module "bun:sqlite" {
   }
 }
 
+declare module "@oh-my-pi/pi-ai" {
+  export function complete(
+    model: unknown,
+    context: { messages: Array<{ role: "user" | "assistant" | "system"; content: Array<{ type: "text"; text: string }>; timestamp?: number }> },
+    options: { apiKey?: string; maxTokens?: number; signal?: AbortSignal },
+  ): Promise<{ content: Array<{ type: string; text?: string }> }>;
+}
+
 declare module "bun:test" {
   export function test(name: string, fn: () => unknown | Promise<unknown>): void;
   export function beforeEach(fn: () => unknown | Promise<unknown>): void;

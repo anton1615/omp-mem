@@ -2,10 +2,39 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { DEFAULT_OMP_MEM_CONFIG, type OmpMemConfig } from "./config";
 
 export type ObservationKind = "bugfix" | "feature" | "decision" | "discovery" | "refactor" | "change" | "preference";
 export type ObservationConfidence = "observed" | "inferred";
 
+
+export interface ObservationExtractionResult {
+  title?: string;
+  narrative?: string;
+  facts?: string[];
+  files?: string[];
+  concepts?: string[];
+  type?: ObservationKind | string;
+  confidence?: ObservationConfidence | string;
+}
+
+export interface ObservationExtractionRequest {
+  contentSessionId: string;
+  project: string;
+  toolName: string;
+  toolInputText: string;
+  toolResponseText: string;
+  combinedText: string;
+  cwd?: string;
+  platformSource: string;
+}
+
+export interface SessionSummaryRequest {
+  contentSessionId: string;
+  project: string;
+  lastAssistantMessage: string;
+  platformSource: string;
+}
 export interface SessionInitRequest {
   contentSessionId: string;
   project?: string;
@@ -25,11 +54,13 @@ export interface ObservationRequest {
   platformSource?: string;
   tool_use_id?: string;
   toolUseId?: string;
+  extraction?: ObservationExtractionResult;
 }
 
 export interface SummarizeRequest {
   contentSessionId: string;
   last_assistant_message?: string;
+  summary?: string;
   agentId?: string;
   platformSource?: string;
 }
@@ -113,11 +144,14 @@ export interface MemoryServiceOptions {
   memoryRoot: string;
   dbPath?: string;
   now?: () => number;
+  config?: OmpMemConfig;
+  extractObservation?: (request: ObservationExtractionRequest) => Promise<ObservationExtractionResult | undefined>;
+  summarizeText?: (request: SessionSummaryRequest) => Promise<string | undefined>;
 }
-
 export interface ResolveMemoryRootOptions {
   cwd: string;
   homeDir?: string;
+  dataDir?: string;
 }
 
 interface ObservationRow {
@@ -148,6 +182,13 @@ interface SearchRow {
   concepts_json: string;
 }
 
+interface SessionSummaryRow {
+  content_session_id: string;
+  project: string;
+  summary: string;
+  created_at: number;
+}
+
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 const DEFAULT_PROJECT = "default";
@@ -158,7 +199,8 @@ const DB_NAME = "omp-mem.sqlite";
 
 export function resolveMemoryRoot(options: ResolveMemoryRootOptions): string {
   const homeDir = options.homeDir ?? os.homedir();
-  return path.join(homeDir, ".omp", "agent", "omp-mem", "state", encodeProjectPath(options.cwd));
+  const dataDir = options.dataDir ?? path.join(homeDir, ".omp", "agent", "omp-mem");
+  return path.join(dataDir, "state", encodeProjectPath(options.cwd));
 }
 
 export async function resolveMemoryDatabasePath(options: MemoryServiceOptions): Promise<string> {
@@ -169,7 +211,14 @@ export async function resolveMemoryDatabasePath(options: MemoryServiceOptions): 
 export async function createMemoryService(options: MemoryServiceOptions): Promise<MemoryService> {
   await fs.mkdir(options.memoryRoot, { recursive: true });
   const db = new Database(await resolveMemoryDatabasePath(options));
-  const service = new MemoryService(db, options.memoryRoot, options.now ?? unixNow);
+  const service = new MemoryService(
+    db,
+    options.memoryRoot,
+    options.now ?? unixNow,
+    options.config ?? DEFAULT_OMP_MEM_CONFIG,
+    options.extractObservation,
+    options.summarizeText,
+  );
   service.initialize();
   return service;
 }
@@ -179,6 +228,9 @@ export class MemoryService {
     readonly db: Database,
     readonly memoryRoot: string,
     readonly now: () => number,
+    readonly config: OmpMemConfig = DEFAULT_OMP_MEM_CONFIG,
+    private readonly extractObservation?: (request: ObservationExtractionRequest) => Promise<ObservationExtractionResult | undefined>,
+    private readonly summarizeText?: (request: SessionSummaryRequest) => Promise<string | undefined>,
   ) {}
 
   initialize(): void {
@@ -257,7 +309,7 @@ ON CONFLICT(content_session_id) DO UPDATE SET
 `)
       .run(request.contentSessionId, project, request.customTitle ?? null, request.platformSource ?? "omp", now, now);
 
-    const promptText = stripPrivateTags(request.prompt ?? "").trim();
+    const promptText = this.redact(request.prompt ?? "").trim();
     if (promptText) {
       this.db
         .prepare("INSERT INTO user_prompts (content_session_id, project, prompt_text, created_at) VALUES (?, ?, ?, ?)")
@@ -271,15 +323,28 @@ ON CONFLICT(content_session_id) DO UPDATE SET
     const project = session?.project ?? normalizeProject(undefined);
     const toolResponse = unknownToText(request.tool_response);
     const toolInput = unknownToText(request.tool_input);
-    const combinedText = stripPrivateTags([toolInput, toolResponse].filter(Boolean).join("\n")).trim();
-    const narrative = clampText(combinedText || `${request.tool_name} completed`, 8_000);
-    const files = extractFiles(narrative);
-    const concepts = extractConcepts(narrative, request.tool_name);
-    const facts = extractFacts(narrative);
-    const type = classifyObservation(narrative);
-    const title = buildTitle(toolResponse || toolInput || request.tool_name);
-    const toolUseId = request.tool_use_id ?? request.toolUseId ?? null;
+    const redactedToolInput = this.redact(toolInput);
+    const redactedToolResponse = this.redact(toolResponse);
+    const combinedText = [redactedToolInput, redactedToolResponse].filter(Boolean).join("\n").trim();
+    const heuristicNarrative = clampText(combinedText || `${request.tool_name} completed`, 8_000);
     const platformSource = request.platformSource ?? "omp";
+    const extracted = request.extraction ?? await this.extractObservationSafe({
+      contentSessionId: request.contentSessionId,
+      project,
+      toolName: request.tool_name,
+      toolInputText: redactedToolInput,
+      toolResponseText: redactedToolResponse,
+      combinedText,
+      cwd: request.cwd,
+      platformSource,
+    });
+    const narrative = clampText(this.redact(extracted?.narrative ?? heuristicNarrative), 8_000);
+    const files = unique(normalizeStringList(extracted?.files, extractFiles(narrative), 20).map(file => clampText(this.redact(file), 240)));
+    const concepts = unique(normalizeStringList(extracted?.concepts, extractConcepts(narrative, request.tool_name), 30).map(concept => clampText(this.redact(concept), 120)));
+    const facts = unique(normalizeStringList(extracted?.facts, extractFacts(narrative), 12).map(fact => clampText(this.redact(fact), 240)));
+    const type = normalizeObservationKind(extracted?.type, classifyObservation(narrative));
+    const title = clampText(this.redact(extracted?.title ?? buildTitle(toolResponse || toolInput || request.tool_name)), 96);
+    const toolUseId = request.tool_use_id ?? request.toolUseId ?? null;
 
     const insert = this.db
       .prepare(`
@@ -300,7 +365,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         JSON.stringify(facts),
         JSON.stringify(files),
         JSON.stringify(concepts),
-        "observed",
+        normalizeConfidence(extracted?.confidence, extracted ? "inferred" : "observed"),
         now,
         request.cwd ?? null,
         platformSource,
@@ -316,11 +381,18 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   async summarizeSession(request: SummarizeRequest): Promise<void> {
     const session = this.getSession(request.contentSessionId);
     const project = session?.project ?? DEFAULT_PROJECT;
-    const summary = stripPrivateTags(request.last_assistant_message ?? "").trim();
-    if (!summary) return;
+    const rawSummary = this.redact(request.last_assistant_message ?? "").trim();
+    const injectedSummary = this.redact(request.summary ?? "").trim();
+    if (!rawSummary && !injectedSummary) return;
+    const summary = injectedSummary || await this.summarizeTextSafe({
+      contentSessionId: request.contentSessionId,
+      project,
+      lastAssistantMessage: rawSummary,
+      platformSource: request.platformSource ?? "omp",
+    }) || rawSummary;
     this.db
       .prepare("INSERT INTO session_summaries (content_session_id, project, summary, created_at) VALUES (?, ?, ?, ?)")
-      .run(request.contentSessionId, project, clampText(summary, 8_000), this.now());
+      .run(request.contentSessionId, project, clampText(this.redact(summary), 8_000), this.now());
     await this.flushArtifacts(project);
   }
 
@@ -328,7 +400,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     if (request.obs_type && request.obs_type !== "observation") {
       return { results: [], total: 0 };
     }
-    const limit = parseLimit(request.limit, DEFAULT_LIMIT);
+    const limit = parseLimit(request.limit, this.config.search.defaultLimit, this.config.search.maxLimit);
     const offset = parseOffset(request.offset);
     const clauses: string[] = [];
     const params: unknown[] = [];
@@ -398,8 +470,8 @@ LIMIT ? OFFSET ?
     const anchor = await this.resolveAnchor(request);
     if (!anchor) return { anchor: null, items: [] };
 
-    const depthBefore = parseLimit(request.depth_before, 3);
-    const depthAfter = parseLimit(request.depth_after, 3);
+    const depthBefore = parseLimit(request.depth_before, 3, this.config.search.maxLimit);
+    const depthAfter = parseLimit(request.depth_after, 3, this.config.search.maxLimit);
     const project = request.project ?? anchor.project;
     const beforeRows = this.db
       .prepare(`
@@ -425,7 +497,7 @@ LIMIT ?
   async getObservations(request: GetObservationsRequest): Promise<MemoryGetResponse> {
     const ids = request.ids.filter(id => Number.isInteger(id) && id > 0);
     if (ids.length === 0) return { observations: [] };
-    const limit = parseLimit(request.limit, ids.length);
+    const limit = parseLimit(request.limit, ids.length, this.config.search.maxLimit);
     const placeholders = ids.map(() => "?").join(", ");
     const params: unknown[] = [...ids];
     const clauses = [`id IN (${placeholders})`];
@@ -451,7 +523,16 @@ LIMIT ?
   }
 
   async injectContext(request: ContextInjectRequest): Promise<string> {
-    const search = await this.search({ query: request.q, project: request.project, limit: request.limit ?? 5 });
+    if (!this.config.context.enabled) return "";
+    const search = await this.search({ query: request.q, project: request.project, limit: request.limit ?? this.config.context.observations });
+    const sessionSummaries = this.getRecentSessionSummaries(request.project, this.config.context.sessions);
+    const fullDetails = this.config.context.fullCount > 0
+      ? await this.getObservations({
+        ids: search.results.slice(0, this.config.context.fullCount).map(result => result.id),
+        orderBy: "date_desc",
+        project: request.project,
+      })
+      : { observations: [] };
     const summary = await readOptional(path.join(this.memoryRoot, "memory_summary.md"));
     const lines = [
       "# Memory Guidance",
@@ -459,8 +540,15 @@ LIMIT ?
       "Treat memory as advisory; current repository state and user instructions win.",
       "",
     ];
-    if (summary.trim()) {
+    if (this.config.context.includeSummary && summary.trim()) {
       lines.push("## Memory summary", summary.trim(), "");
+    }
+    if (sessionSummaries.length > 0) {
+      lines.push("## Recent session summaries");
+      for (const item of sessionSummaries) {
+        lines.push(`- ${clampText(item.summary, 480)}`);
+      }
+      lines.push("");
     }
     if (search.results.length > 0) {
       lines.push("## Relevant memory index");
@@ -469,17 +557,46 @@ LIMIT ?
       }
       lines.push("Use memory_get_observations with filtered IDs before relying on details.");
     }
+    if (fullDetails.observations.length > 0) {
+      lines.push("", "## Full memory details");
+      for (const observation of fullDetails.observations) {
+        const facts = observation.facts.map(fact => `  - ${fact}`).join("\n");
+        const files = observation.files.length > 0 ? `\nFiles: ${observation.files.join(", ")}` : "";
+        lines.push(`#${observation.id} [${observation.type}] ${observation.title}`);
+        lines.push(`${observation.narrative}${files}${facts ? `\nFacts:\n${facts}` : ""}`);
+      }
+    }
     return lines.join("\n").trim();
   }
 
   async flushArtifacts(project?: string): Promise<void> {
+    if (!this.config.artifacts.enabled) return;
     await fs.mkdir(this.memoryRoot, { recursive: true });
-    const search = await this.search({ project, limit: 50, orderBy: "date_desc" });
-    const details = await this.getObservations({ ids: search.results.map(result => result.id), orderBy: "date_desc" });
-    const summary = buildSummaryArtifact(details.observations);
-    const full = buildFullArtifact(details.observations);
-    await Bun.write(path.join(this.memoryRoot, "memory_summary.md"), summary);
-    await Bun.write(path.join(this.memoryRoot, "MEMORY.md"), full);
+    const observations = this.getRecentObservations(project, this.config.artifacts.maxObservations);
+    const summary = buildSummaryArtifact(observations);
+    const full = buildFullArtifact(observations);
+    if (this.config.artifacts.writeSummary) await Bun.write(path.join(this.memoryRoot, "memory_summary.md"), summary);
+    if (this.config.artifacts.writeMemoryMd) await Bun.write(path.join(this.memoryRoot, "MEMORY.md"), full);
+  }
+
+  private getRecentObservations(project: string | undefined, limit: number): MemoryObservation[] {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (project) {
+      clauses.push("project = ?");
+      params.push(project);
+    }
+    const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const safeLimit = Math.max(1, Math.floor(limit));
+    const rows = this.db
+      .prepare(`
+SELECT * FROM observations
+${whereSql}
+ORDER BY created_at DESC, id DESC
+LIMIT ?
+`)
+      .all(...params, safeLimit) as ObservationRow[];
+    return rows.map(rowToObservation);
   }
 
   close(): void {
@@ -511,6 +628,51 @@ LIMIT ?
       }
     }
     return undefined;
+  }
+
+  private redact(text: string): string {
+    return this.config.redaction.privateTag ? stripPrivateTags(text) : text;
+  }
+
+  private async extractObservationSafe(request: ObservationExtractionRequest): Promise<ObservationExtractionResult | undefined> {
+    if (!this.extractObservation || this.config.ai.provider !== "omp") return undefined;
+    try {
+      return await this.extractObservation(request);
+    } catch (error) {
+      if (this.config.ai.failOpen) return undefined;
+      throw error;
+    }
+  }
+
+  private async summarizeTextSafe(request: SessionSummaryRequest): Promise<string | undefined> {
+    if (!this.summarizeText || this.config.ai.provider !== "omp") return undefined;
+    try {
+      const summary = await this.summarizeText(request);
+      return summary?.trim() ? summary : undefined;
+    } catch (error) {
+      if (this.config.ai.failOpen) return undefined;
+      throw error;
+    }
+  }
+
+  private getRecentSessionSummaries(project: string | undefined, limit: number): SessionSummaryRow[] {
+    if (limit <= 0) return [];
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (project) {
+      clauses.push("project = ?");
+      params.push(project);
+    }
+    const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    return this.db
+      .prepare(`
+SELECT content_session_id, project, summary, created_at
+FROM session_summaries
+${whereSql}
+ORDER BY created_at DESC, rowid DESC
+LIMIT ?
+`)
+      .all(...params, limit) as SessionSummaryRow[];
   }
 }
 
@@ -647,6 +809,30 @@ function extractFacts(text: string): string[] {
     .map(line => clampText(line, 240));
 }
 
+function normalizeStringList(value: unknown, fallback: string[], limit: number): string[] {
+  if (!Array.isArray(value)) return fallback;
+  const normalized = value
+    .map(item => (typeof item === "string" ? item.trim() : ""))
+    .filter(Boolean);
+  return unique(normalized).slice(0, limit);
+}
+
+function normalizeObservationKind(value: unknown, fallback: ObservationKind): ObservationKind {
+  return value === "bugfix" ||
+    value === "feature" ||
+    value === "decision" ||
+    value === "discovery" ||
+    value === "refactor" ||
+    value === "change" ||
+    value === "preference"
+    ? value
+    : fallback;
+}
+
+function normalizeConfidence(value: unknown, fallback: ObservationConfidence): ObservationConfidence {
+  return value === "observed" || value === "inferred" ? value : fallback;
+}
+
 function parseJsonArray(value: string): string[] {
   try {
     const parsed = JSON.parse(value) as unknown;
@@ -656,10 +842,10 @@ function parseJsonArray(value: string): string[] {
   }
 }
 
-function parseLimit(value: number | string | undefined, fallback: number): number {
+function parseLimit(value: number | string | undefined, fallback: number, max = MAX_LIMIT): number {
   const parsed = typeof value === "string" ? Number(value) : value;
   if (!parsed || !Number.isFinite(parsed)) return fallback;
-  return Math.max(1, Math.min(MAX_LIMIT, Math.floor(parsed)));
+  return Math.max(1, Math.min(max, Math.floor(parsed)));
 }
 
 function parseOffset(value: number | string | undefined): number {
