@@ -7,6 +7,7 @@ import { resolveOmpMemConfig } from "../src/config";
 
 interface FakeTool {
   name: string;
+  parameters?: unknown;
   execute(toolCallId: string, params: Record<string, unknown>, onUpdate?: unknown, ctx?: FakeContext): Promise<{ content: Array<{ type: "text"; text: string }> }>;
 }
 
@@ -44,6 +45,7 @@ function createFakeApi() {
       String: () => ({ type: "string" }),
       Number: () => ({ type: "number" }),
       Array: (items: unknown) => ({ type: "array", items }),
+      Boolean: () => ({ type: "boolean" }),
       Optional: (schema: unknown) => schema,
       Union: (items: unknown[]) => ({ anyOf: items }),
       Literal: (value: unknown) => ({ const: value }),
@@ -94,6 +96,15 @@ test("registers claude-mem compatible memory tools", async () => {
 
   expect([...fake.tools.keys()].sort()).toEqual(["memory_get_observations", "memory_remember", "memory_search", "memory_timeline"]);
   expect(fake.commands.has("mem")).toBe(true);
+});
+
+test("memory_search schema exposes folder file filter", async () => {
+  const fake = createFakeApi();
+
+  await registerOmpMemExtension(fake.api, { memoryRoot: tempRoot, dbPath: ":memory:", now: () => 1_700_000_000 });
+
+  const parameters = fake.tools.get("memory_search")?.parameters as { shape?: Record<string, unknown> } | undefined;
+  expect(parameters?.shape?.isFolder).toEqual({ type: "boolean" });
 });
 
 test("memory_remember stores manual memory through local tool", async () => {

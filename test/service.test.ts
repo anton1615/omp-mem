@@ -341,6 +341,40 @@ test("search concept and file filters handle JSON escaped backslashes and percen
   expect(byBackslashFile.results.map(result => result.id)).toEqual([id]);
 });
 
+test("manual memory subtitle is searchable through observation FTS", async () => {
+  const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
+
+  const id = await service.remember({
+    text: "Durable user preference without the subtitle keyword.",
+    title: "Preference record",
+    project: "app",
+  });
+
+  const search = await service.search({ query: "Manual", project: "app", obs_type: "observation" });
+
+  expect(search.results.map(result => result.id)).toEqual([id]);
+});
+
+test("folder file filters only match direct child files", async () => {
+  const service = await createTrackedService({
+    memoryRoot: tempRoot,
+    now: (() => {
+      let current = 1_700_000_000;
+      return () => current++;
+    })(),
+    extractObservation: async request => request.toolResponseText.includes("direct")
+      ? { title: "Direct child", narrative: "Direct child detail", type: "discovery", files: ["src/direct.ts"] }
+      : { title: "Nested child", narrative: "Nested child detail", type: "discovery", files: ["src/nested/child.ts"] },
+  });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Filter folder files" });
+  const direct = await service.recordObservation(makeObservation({ tool_use_id: "tool-direct", tool_response: "direct" }));
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-nested", tool_response: "nested" }));
+
+  const search = await service.search({ project: "app", obs_type: "observation", filePath: "src", isFolder: true } as never);
+
+  expect(search.results.map(result => result.id)).toEqual([direct]);
+});
+
 test("unknown obs_type returns no records instead of broad observation search", async () => {
   const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
   await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Unknown filter" });
@@ -566,6 +600,129 @@ test("summarizeSession redacts and clamps injected summary without raw assistant
   expect((row?.summary.length ?? 0) <= 8_000).toBe(true);
 });
 
+test("summarizeSession stores structured upstream summary fields", async () => {
+  const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Implement memory parity" });
+
+  await service.summarizeSession({
+    contentSessionId: "session-1",
+    summary: JSON.stringify({
+      request: "Implement SQLite parity",
+      investigated: "Compared upstream search and context builders",
+      learned: "Session summaries need structured fields",
+      completed: "Added SQLite FTS coverage",
+      next_steps: "Run rare-next-step verification",
+      files_read: ["temp/claude-mem-upstream/src/services/context/ContextBuilder.ts"],
+      files_edited: ["agent/extensions/omp-mem/src/service.ts"],
+      notes: "Keep Chroma out of scope",
+    }),
+  });
+
+  const row = service.db.prepare("SELECT summary, request, investigated, learned, completed, next_steps, files_read, files_edited, notes FROM session_summaries WHERE content_session_id = ?").get("session-1") as Record<string, string>;
+  const search = await service.search({ query: "rare-next-step", project: "app", obs_type: "session" });
+
+  expect(row.summary).not.toContain("{\"");
+  expect(row.request).toBe("Implement SQLite parity");
+  expect(row.investigated).toBe("Compared upstream search and context builders");
+  expect(row.learned).toBe("Session summaries need structured fields");
+  expect(row.completed).toBe("Added SQLite FTS coverage");
+  expect(row.next_steps).toBe("Run rare-next-step verification");
+  expect(JSON.parse(row.files_read)).toEqual(["temp/claude-mem-upstream/src/services/context/ContextBuilder.ts"]);
+  expect(JSON.parse(row.files_edited)).toEqual(["agent/extensions/omp-mem/src/service.ts"]);
+  expect(row.notes).toBe("Keep Chroma out of scope");
+  expect(search.results.map(result => result.ref)).toEqual(["S1"]);
+});
+
+test("session summary FTS covers direct SQLite structured fields", async () => {
+  const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
+  service.db.prepare(`
+INSERT INTO session_summaries (
+  content_session_id, memory_session_id, project, summary, request, investigated, learned, completed, next_steps, notes, created_at, created_at_epoch
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`).run(
+    "manual-session",
+    "omp-mem:manual-session",
+    "app",
+    "Generic direct summary",
+    "Generic request",
+    "Generic investigation",
+    "Generic learning",
+    "Generic completion",
+    "Direct rare-next-step from sqlite trigger",
+    "Generic notes",
+    1_700_000_000,
+    1_700_000_000,
+  );
+
+  const tables = new Set((service.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(row => row.name));
+  const search = await service.search({ query: "rare-next-step", project: "app", obs_type: "session" });
+
+  expect(tables.has("session_summaries_fts")).toBe(true);
+  expect(search.results.map(result => result.ref)).toEqual(["S1"]);
+});
+
+test("session summary FTS covers direct SQLite summary-only rows", async () => {
+  const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
+  service.db.prepare(`
+INSERT INTO session_summaries (
+  content_session_id, memory_session_id, project, summary, created_at
+) VALUES (?, ?, ?, ?, ?)
+`).run("summary-only-session", "omp-mem:summary-only-session", "app", "Direct summary-only-needle text", 1_700_000_000);
+
+  const search = await service.search({ query: "summary-only-needle", project: "app", obs_type: "session" });
+
+  expect(search.results.map(result => result.ref)).toEqual(["S1"]);
+});
+
+test("observation FTS rebuild indexes legacy json-only rows", async () => {
+  const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
+  service.db.prepare(`
+INSERT INTO observations (
+  content_session_id, project, tool_name, type, title, narrative, facts_json, files_json, concepts_json, confidence, created_at, platform_source
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`).run(
+    "legacy-session",
+    "app",
+    "bash",
+    "discovery",
+    "Legacy json-only row",
+    "Legacy narrative",
+    JSON.stringify(["legacyfact-needle"]),
+    JSON.stringify(["src/legacy.ts"]),
+    JSON.stringify(["legacy-concept"]),
+    "observed",
+    1_700_000_000,
+    "omp",
+  );
+
+  const byFact = await service.search({ query: "legacyfact-needle", project: "app" });
+  const byFile = await service.search({ query: "legacy", project: "app", filePath: "src/legacy.ts" });
+  const byConcept = await service.search({ query: "legacy", project: "app", concept: "legacy-concept" });
+
+  expect(byFact.results.map(result => result.ref)).toEqual(["#1"]);
+  expect(byFile.results.map(result => result.ref)).toEqual(["#1"]);
+  expect(byConcept.results.map(result => result.ref)).toEqual(["#1"]);
+});
+
+test("project filters include memories adopted into the requested project", async () => {
+  const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
+  await service.initSession({ contentSessionId: "worktree-session", project: "app-worktree", prompt: "Worktree work" });
+  const id = await service.recordObservation(makeObservation({ contentSessionId: "worktree-session", tool_use_id: "tool-worktree", tool_response: "Worktree auth fix" }));
+  await service.summarizeSession({ contentSessionId: "worktree-session", summary: "Worktree summary should surface in parent project" });
+  service.db.prepare("UPDATE observations SET merged_into_project = ? WHERE id = ?").run("app", id);
+  service.db.prepare("UPDATE session_summaries SET merged_into_project = ? WHERE content_session_id = ?").run("app", "worktree-session");
+
+  const observations = await service.search({ query: "auth", project: "app", obs_type: "observation" });
+  const sessions = await service.search({ query: "summary", project: "app", obs_type: "session" });
+  const details = await service.getObservations({ ids: [id], project: "app" });
+  const context = await service.injectContext({ project: "app", q: "auth", limit: 5 });
+
+  expect(observations.results.map(result => result.id)).toEqual([id]);
+  expect(sessions.results.map(result => result.ref)).toEqual(["S1"]);
+  expect(details.observations.map(observation => observation.id)).toEqual([id]);
+  expect(context).toContain("Worktree auth fix");
+});
+
 test("flushArtifacts honors artifact max above public search cap", async () => {
   const service = await createTrackedService({
     memoryRoot: tempRoot,
@@ -620,5 +777,7 @@ test("summarizeSession uses configured model summary and falls back safely", asy
   await service.summarizeSession({ contentSessionId: "session-1", last_assistant_message: "Raw assistant final message" });
 
   const row = service.db.prepare("SELECT summary FROM session_summaries WHERE content_session_id = ?").get("session-1") as { summary: string } | undefined;
+  const search = await service.search({ query: "completed auth", project: "app", obs_type: "session" });
   expect(row?.summary).toBe("AI session summary for completed auth work.");
+  expect(search.results[0]?.title).toBe("AI session summary for completed auth work.");
 });

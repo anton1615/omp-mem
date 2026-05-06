@@ -82,6 +82,7 @@ export interface SearchRequest {
   concepts?: string | string[];
   filePath?: string | string[];
   files?: string | string[];
+  isFolder?: boolean | string;
 }
 
 export interface TimelineRequest {
@@ -227,9 +228,18 @@ interface SearchRow {
 }
 
 interface SessionSummaryRow {
+  id: number;
   content_session_id: string;
   project: string;
   summary: string;
+  request: string | null;
+  investigated: string | null;
+  learned: string | null;
+  completed: string | null;
+  next_steps: string | null;
+  files_read: string | null;
+  files_edited: string | null;
+  notes: string | null;
   created_at: number;
 }
 
@@ -246,6 +256,14 @@ interface SessionRow {
   content_session_id: string;
   project: string;
   summary: string;
+  request: string | null;
+  investigated: string | null;
+  learned: string | null;
+  completed: string | null;
+  next_steps: string | null;
+  files_read: string | null;
+  files_edited: string | null;
+  notes: string | null;
   created_at: number;
 }
 
@@ -254,6 +272,7 @@ interface SearchScope {
   observationTypes: string[];
   concepts: string[];
   files: string[];
+  isFolder: boolean;
 }
 
 const DEFAULT_LIMIT = 20;
@@ -375,7 +394,9 @@ CREATE TABLE IF NOT EXISTS observations (
 
 CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts USING fts5(
   title,
+  subtitle,
   narrative,
+  text,
   facts,
   files,
   concepts,
@@ -401,6 +422,17 @@ CREATE TABLE IF NOT EXISTS session_summaries (
   merged_into_project TEXT,
   created_at INTEGER NOT NULL,
   created_at_epoch INTEGER
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS session_summaries_fts USING fts5(
+  summary,
+  request,
+  investigated,
+  learned,
+  completed,
+  next_steps,
+  notes,
+  content=''
 );
 
 CREATE TABLE IF NOT EXISTS pending_messages (
@@ -433,6 +465,7 @@ CREATE TABLE IF NOT EXISTS observation_feedback (
 );
 `);
     this.ensureSchemaColumns();
+    this.ensureFtsTables();
     this.db.exec(`
 CREATE INDEX IF NOT EXISTS idx_sdk_sessions_project ON sdk_sessions(project);
 CREATE INDEX IF NOT EXISTS idx_sdk_sessions_status ON sdk_sessions(status);
@@ -440,8 +473,10 @@ CREATE INDEX IF NOT EXISTS idx_observations_project ON observations(project);
 CREATE INDEX IF NOT EXISTS idx_observations_type ON observations(type);
 CREATE INDEX IF NOT EXISTS idx_observations_created ON observations(created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_observations_memory_hash ON observations(memory_session_id, content_hash) WHERE content_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_observations_merged_into ON observations(merged_into_project);
 CREATE INDEX IF NOT EXISTS idx_session_summaries_project ON session_summaries(project);
 CREATE INDEX IF NOT EXISTS idx_session_summaries_created ON session_summaries(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_summaries_merged_into ON session_summaries(merged_into_project);
 CREATE INDEX IF NOT EXISTS idx_user_prompts_project ON user_prompts(project);
 CREATE INDEX IF NOT EXISTS idx_user_prompts_created ON user_prompts(created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_session_tool ON pending_messages(content_session_id, tool_use_id) WHERE tool_use_id IS NOT NULL;
@@ -512,6 +547,89 @@ CREATE INDEX IF NOT EXISTS idx_feedback_observation ON observation_feedback(obse
         if (!existing.has(column)) this.db.prepare(`ALTER TABLE ${table} ADD COLUMN ${definition}`).run();
       }
     }
+  }
+
+  private ensureFtsTables(): void {
+    this.dropFtsTriggers();
+    const observationColumns = tableColumns(this.db, "observations_fts");
+    const expectedObservationColumns = ["title", "subtitle", "narrative", "text", "facts", "files", "concepts"];
+    if (observationColumns.length > 0 && !expectedObservationColumns.every(column => observationColumns.includes(column))) {
+      this.db.exec("DROP TABLE IF EXISTS observations_fts;");
+    }
+    const summaryColumns = tableColumns(this.db, "session_summaries_fts");
+    const expectedSummaryColumns = ["summary", "request", "investigated", "learned", "completed", "next_steps", "notes"];
+    if (summaryColumns.length > 0 && !expectedSummaryColumns.every(column => summaryColumns.includes(column))) {
+      this.db.exec("DROP TABLE IF EXISTS session_summaries_fts;");
+    }
+    this.db.exec(`
+CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts USING fts5(
+  title,
+  subtitle,
+  narrative,
+  text,
+  facts,
+  files,
+  concepts,
+  content=''
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS session_summaries_fts USING fts5(
+  summary,
+  request,
+  investigated,
+  learned,
+  completed,
+  next_steps,
+  notes,
+  content=''
+);
+`);
+    this.createFtsTriggers();
+    this.rebuildFtsIndex();
+    this.rebuildSessionSummaryFtsIndex();
+  }
+
+  private dropFtsTriggers(): void {
+    this.db.exec(`
+DROP TRIGGER IF EXISTS observations_fts_ai;
+DROP TRIGGER IF EXISTS observations_fts_ad;
+DROP TRIGGER IF EXISTS observations_fts_au;
+DROP TRIGGER IF EXISTS session_summaries_fts_ai;
+DROP TRIGGER IF EXISTS session_summaries_fts_ad;
+DROP TRIGGER IF EXISTS session_summaries_fts_au;
+`);
+  }
+
+  private createFtsTriggers(): void {
+    this.db.exec(`
+CREATE TRIGGER IF NOT EXISTS observations_fts_ai AFTER INSERT ON observations BEGIN
+  INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, files, concepts)
+  VALUES (new.id, new.title, new.subtitle, new.narrative, COALESCE(NULLIF(new.text, ''), new.narrative), COALESCE(NULLIF(new.facts, ''), new.facts_json), COALESCE(NULLIF(new.files_read, ''), new.files_json), COALESCE(NULLIF(new.concepts, ''), new.concepts_json));
+END;
+CREATE TRIGGER IF NOT EXISTS observations_fts_ad AFTER DELETE ON observations BEGIN
+  INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, files, concepts)
+  VALUES('delete', old.id, old.title, old.subtitle, old.narrative, COALESCE(NULLIF(old.text, ''), old.narrative), COALESCE(NULLIF(old.facts, ''), old.facts_json), COALESCE(NULLIF(old.files_read, ''), old.files_json), COALESCE(NULLIF(old.concepts, ''), old.concepts_json));
+END;
+CREATE TRIGGER IF NOT EXISTS observations_fts_au AFTER UPDATE ON observations BEGIN
+  INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, files, concepts)
+  VALUES('delete', old.id, old.title, old.subtitle, old.narrative, COALESCE(NULLIF(old.text, ''), old.narrative), COALESCE(NULLIF(old.facts, ''), old.facts_json), COALESCE(NULLIF(old.files_read, ''), old.files_json), COALESCE(NULLIF(old.concepts, ''), old.concepts_json));
+  INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, files, concepts)
+  VALUES (new.id, new.title, new.subtitle, new.narrative, COALESCE(NULLIF(new.text, ''), new.narrative), COALESCE(NULLIF(new.facts, ''), new.facts_json), COALESCE(NULLIF(new.files_read, ''), new.files_json), COALESCE(NULLIF(new.concepts, ''), new.concepts_json));
+END;
+CREATE TRIGGER IF NOT EXISTS session_summaries_fts_ai AFTER INSERT ON session_summaries BEGIN
+  INSERT INTO session_summaries_fts(rowid, summary, request, investigated, learned, completed, next_steps, notes)
+  VALUES (new.id, new.summary, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
+END;
+CREATE TRIGGER IF NOT EXISTS session_summaries_fts_ad AFTER DELETE ON session_summaries BEGIN
+  INSERT INTO session_summaries_fts(session_summaries_fts, rowid, summary, request, investigated, learned, completed, next_steps, notes)
+  VALUES('delete', old.id, old.summary, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
+END;
+CREATE TRIGGER IF NOT EXISTS session_summaries_fts_au AFTER UPDATE ON session_summaries BEGIN
+  INSERT INTO session_summaries_fts(session_summaries_fts, rowid, summary, request, investigated, learned, completed, next_steps, notes)
+  VALUES('delete', old.id, old.summary, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
+  INSERT INTO session_summaries_fts(rowid, summary, request, investigated, learned, completed, next_steps, notes)
+  VALUES (new.id, new.summary, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
+END;
+`);
   }
 
   async initSession(request: SessionInitRequest): Promise<void> {
@@ -651,9 +769,6 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
       );
 
     const id = Number(insert.lastInsertRowid);
-    this.db
-      .prepare("INSERT INTO observations_fts (rowid, title, narrative, facts, files, concepts) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(id, title, narrative, facts.join(" "), files.join(" "), concepts.join(" "));
     this.applyRetention(project);
     return id;
   }
@@ -697,17 +812,35 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
       lastAssistantMessage: rawSummary,
       platformSource: request.platformSource ?? "omp",
     }) || rawSummary;
-    const cleanSummary = clampText(this.redact(summary), 8_000);
-    const persistedRequest = injectedSummary ? null : rawSummary || null;
+    const structured = parseStructuredSummary(this.redact(summary));
+    const cleanSummary = structured
+      ? buildStructuredSummaryText(structured)
+      : clampText(this.redact(summary), 8_000);
+    const persistedRequest = structured?.request ?? (injectedSummary ? null : rawSummary || null);
     const now = this.now();
     this.db
       .prepare(`
 INSERT INTO session_summaries (
-  content_session_id, memory_session_id, project, summary, request, investigated, learned, completed, next_steps, notes, created_at, created_at_epoch
+  content_session_id, memory_session_id, project, summary, request, investigated, learned, completed, next_steps, files_read, files_edited, notes, created_at, created_at_epoch
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `)
-      .run(request.contentSessionId, memorySessionId, project, cleanSummary, persistedRequest, null, cleanSummary, null, null, cleanSummary, now, now);
+      .run(
+        request.contentSessionId,
+        memorySessionId,
+        project,
+        cleanSummary,
+        persistedRequest,
+        structured?.investigated ?? null,
+        structured?.learned ?? (structured ? null : cleanSummary),
+        structured?.completed ?? null,
+        structured?.next_steps ?? null,
+        structured ? JSON.stringify(structured.files_read) : null,
+        structured ? JSON.stringify(structured.files_edited) : null,
+        structured?.notes ?? (structured ? null : cleanSummary),
+        now,
+        now,
+      );
     this.db
       .prepare("UPDATE sdk_sessions SET status = 'completed', completed_at = ?, completed_at_epoch = ?, updated_at = ? WHERE content_session_id = ?")
       .run(isoFromUnix(now), now, now, request.contentSessionId);
@@ -742,8 +875,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     const clauses: string[] = [];
     const params: unknown[] = [];
     if (request.project) {
-      clauses.push("o.project = ?");
-      params.push(request.project);
+      appendProjectClauses(clauses, params, "o");
+      params.push(request.project, request.project);
     }
     if (scope.observationTypes.length === 1) {
       clauses.push("o.type = ?");
@@ -773,7 +906,7 @@ ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
 
     return rows
       .filter(row => matchesJsonArrayFilters(parseJsonArray(row.concepts_json), scope.concepts, "exact"))
-      .filter(row => matchesJsonArrayFilters(parseJsonArray(row.files_json), scope.files, "contains"))
+      .filter(row => matchesFileFilters(parseJsonArray(row.files_json), scope.files, scope.isFolder))
       .map(row => ({
         id: row.id,
         ref: `#${row.id}`,
@@ -792,18 +925,27 @@ ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
     const clauses: string[] = [];
     const params: unknown[] = [];
     if (request.project) {
-      clauses.push("project = ?");
-      params.push(request.project);
+      appendProjectClauses(clauses, params, "s");
+      params.push(request.project, request.project);
     }
-    appendDateClauses(clauses, params, "created_at", request.dateStart, request.dateEnd);
-    appendLikeClause(clauses, params, ["summary", "request", "learned", "notes"], request.query);
-    const rows = this.db
-      .prepare(`
-SELECT id, content_session_id, project, summary, created_at
-FROM session_summaries
+    appendDateClauses(clauses, params, "s.created_at", request.dateStart, request.dateEnd);
+    const query = sanitizeFtsQuery(request.query);
+    const rows = query
+      ? this.db
+        .prepare(`
+SELECT s.id, s.content_session_id, s.project, s.summary, s.request, s.investigated, s.learned, s.completed, s.next_steps, s.files_read, s.files_edited, s.notes, s.created_at, rank
+FROM session_summaries_fts f
+JOIN session_summaries s ON s.id = f.rowid
+WHERE session_summaries_fts MATCH ?${clauses.length > 0 ? ` AND ${clauses.join(" AND ")}` : ""}
+`)
+        .all(query, ...params) as Array<SessionRow & { rank?: number }>
+      : this.db
+        .prepare(`
+SELECT s.id, s.content_session_id, s.project, s.summary, s.request, s.investigated, s.learned, s.completed, s.next_steps, s.files_read, s.files_edited, s.notes, s.created_at
+FROM session_summaries s
 ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
 `)
-      .all(...params) as SessionRow[];
+        .all(...params) as Array<SessionRow & { rank?: number }>;
     return rows.map(row => ({
       id: row.id,
       ref: `S${row.id}`,
@@ -811,10 +953,11 @@ ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
       createdAt: row.created_at,
       project: row.project,
       type: "session",
-      title: clampText(row.summary.replace(/\s+/g, " "), 96),
-      files: [],
+      title: clampText(summaryTitle(row).replace(/\s+/g, " "), 96),
+      files: unique([...parseJsonArray(row.files_read ?? "[]"), ...parseJsonArray(row.files_edited ?? "[]")]),
       concepts: [],
-    }));
+      ...(row.rank !== undefined ? { rank: row.rank } : {}),
+    } as MemorySearchIndexResult & { rank?: number }));
   }
 
   private searchPrompts(request: SearchRequest, _scope: SearchScope): MemorySearchIndexResult[] {
@@ -862,14 +1005,14 @@ ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
 
   private getTimelineItems(project?: string): MemoryTimelineItem[] {
     const observationRows = project
-      ? this.db.prepare("SELECT * FROM observations WHERE project = ?").all(project)
+      ? this.db.prepare("SELECT * FROM observations WHERE project = ? OR merged_into_project = ?").all(project, project)
       : this.db.prepare("SELECT * FROM observations").all();
     const promptRows = project
       ? this.db.prepare("SELECT id, content_session_id, project, prompt_text, created_at FROM user_prompts WHERE project = ?").all(project)
       : this.db.prepare("SELECT id, content_session_id, project, prompt_text, created_at FROM user_prompts").all();
     const summaryRows = project
-      ? this.db.prepare("SELECT id, content_session_id, project, summary, created_at FROM session_summaries WHERE project = ?").all(project)
-      : this.db.prepare("SELECT id, content_session_id, project, summary, created_at FROM session_summaries").all();
+      ? this.db.prepare("SELECT id, content_session_id, project, summary, request, investigated, learned, completed, next_steps, files_read, files_edited, notes, created_at FROM session_summaries WHERE project = ? OR merged_into_project = ?").all(project, project)
+      : this.db.prepare("SELECT id, content_session_id, project, summary, request, investigated, learned, completed, next_steps, files_read, files_edited, notes, created_at FROM session_summaries").all();
     const observations = (observationRows as ObservationRow[]).map(rowToObservation);
     const prompts = (promptRows as PromptRow[]).map(rowToPromptTimelineItem);
     const summaries = (summaryRows as SessionRow[]).map(rowToSessionTimelineItem);
@@ -884,8 +1027,8 @@ ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
     const params: unknown[] = [...ids];
     const clauses = [`id IN (${placeholders})`];
     if (request.project) {
-      clauses.push("project = ?");
-      params.push(request.project);
+      clauses.push("(project = ? OR merged_into_project = ?)");
+      params.push(request.project, request.project);
     }
     const rows = this.db
       .prepare(`SELECT * FROM observations WHERE ${clauses.join(" AND ")}`)
@@ -963,8 +1106,8 @@ ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
     const clauses: string[] = [];
     const params: unknown[] = [];
     if (project) {
-      clauses.push("project = ?");
-      params.push(project);
+      clauses.push("(project = ? OR merged_into_project = ?)");
+      params.push(project, project);
     }
     const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
     const safeLimit = Math.max(1, Math.floor(limit));
@@ -984,8 +1127,8 @@ LIMIT ?
     const clauses: string[] = [];
     const params: unknown[] = [];
     if (request.project) {
-      clauses.push("o.project = ?");
-      params.push(request.project);
+      appendProjectClauses(clauses, params, "o");
+      params.push(request.project, request.project);
     }
     if (this.config.context.types.length === 1) {
       clauses.push("o.type = ?");
@@ -1106,13 +1249,13 @@ ORDER BY o.created_at DESC, o.id DESC
     const clauses: string[] = [];
     const params: unknown[] = [];
     if (project) {
-      clauses.push("project = ?");
-      params.push(project);
+      clauses.push("(project = ? OR merged_into_project = ?)");
+      params.push(project, project);
     }
     const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
     return this.db
       .prepare(`
-SELECT content_session_id, project, summary, created_at
+SELECT id, content_session_id, project, summary, request, investigated, learned, completed, next_steps, files_read, files_edited, notes, created_at
 FROM session_summaries
 ${whereSql}
 ORDER BY created_at DESC, rowid DESC
@@ -1154,11 +1297,22 @@ LIMIT -1 OFFSET ?
   private rebuildFtsIndex(): void {
     this.db.prepare("INSERT INTO observations_fts(observations_fts) VALUES('delete-all')").run();
     const rows = this.db
-      .prepare("SELECT id, title, narrative, facts_json, files_json, concepts_json FROM observations")
-      .all() as Array<{ id: number; title: string; narrative: string; facts_json: string; files_json: string; concepts_json: string }>;
-    const insert = this.db.prepare("INSERT INTO observations_fts (rowid, title, narrative, facts, files, concepts) VALUES (?, ?, ?, ?, ?, ?)");
+      .prepare("SELECT id, title, subtitle, narrative, COALESCE(NULLIF(text, ''), narrative) AS text, COALESCE(NULLIF(facts, ''), facts_json) AS facts, COALESCE(NULLIF(files_read, ''), files_json) AS files_read, COALESCE(NULLIF(concepts, ''), concepts_json) AS concepts FROM observations")
+      .all() as Array<{ id: number; title: string; subtitle: string | null; narrative: string; text: string | null; facts: string | null; files_read: string | null; concepts: string | null }>;
+    const insert = this.db.prepare("INSERT INTO observations_fts (rowid, title, subtitle, narrative, text, facts, files, concepts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
     for (const row of rows) {
-      insert.run(row.id, row.title, row.narrative, parseJsonArray(row.facts_json).join(" "), parseJsonArray(row.files_json).join(" "), parseJsonArray(row.concepts_json).join(" "));
+      insert.run(row.id, row.title, row.subtitle, row.narrative, row.text, row.facts, row.files_read, row.concepts);
+    }
+  }
+
+  private rebuildSessionSummaryFtsIndex(): void {
+    this.db.prepare("INSERT INTO session_summaries_fts(session_summaries_fts) VALUES('delete-all')").run();
+    const rows = this.db
+      .prepare("SELECT id, summary, request, investigated, learned, completed, next_steps, notes FROM session_summaries")
+      .all() as Array<{ id: number; summary: string; request: string | null; investigated: string | null; learned: string | null; completed: string | null; next_steps: string | null; notes: string | null }>;
+    const insert = this.db.prepare("INSERT INTO session_summaries_fts (rowid, summary, request, investigated, learned, completed, next_steps, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const row of rows) {
+      insert.run(row.id, row.summary, row.request, row.investigated, row.learned, row.completed, row.next_steps, row.notes);
     }
   }
 }
@@ -1255,7 +1409,7 @@ function rowToPromptTimelineItem(row: PromptRow): MemoryTimelineItem {
 }
 
 function rowToSessionTimelineItem(row: SessionRow): MemoryTimelineItem {
-  const title = clampText(row.summary.replace(/\s+/g, " "), 96);
+  const title = clampText(summaryTitle(row).replace(/\s+/g, " "), 96);
   return {
     id: row.id,
     ref: `S${row.id}`,
@@ -1266,7 +1420,7 @@ function rowToSessionTimelineItem(row: SessionRow): MemoryTimelineItem {
     title,
     narrative: row.summary,
     facts: [],
-    files: [],
+    files: unique([...parseJsonArray(row.files_read ?? "[]"), ...parseJsonArray(row.files_edited ?? "[]")]),
     concepts: [],
   };
 }
@@ -1415,6 +1569,21 @@ function parseJsonObject(value: string | null): Record<string, unknown> | null {
   }
 }
 
+
+interface StructuredSummary {
+  request: string | null;
+  investigated: string | null;
+  learned: string | null;
+  completed: string | null;
+  next_steps: string | null;
+  files_read: string[];
+  files_edited: string[];
+  notes: string | null;
+}
+
+function tableColumns(db: Database, tableName: string): string[] {
+  return (db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>).map(row => row.name);
+}
 function normalizeSearchScope(request: SearchRequest): SearchScope {
   const rawTypeValues = [...parseStringValues(request.type), ...parseStringValues(request.obs_type)];
   const recordTypes = new Set<SearchRecordType>();
@@ -1434,6 +1603,7 @@ function normalizeSearchScope(request: SearchRequest): SearchScope {
       observationTypes: [],
       concepts: parseStringValues(request.concepts ?? request.concept),
       files: parseStringValues(request.files ?? request.filePath),
+      isFolder: parseBoolean(request.isFolder),
     };
   }
   if (recordTypes.size === 0) {
@@ -1444,6 +1614,7 @@ function normalizeSearchScope(request: SearchRequest): SearchScope {
     observationTypes: [...observationTypes],
     concepts: parseStringValues(request.concepts ?? request.concept),
     files: parseStringValues(request.files ?? request.filePath),
+    isFolder: parseBoolean(request.isFolder),
   };
 }
 
@@ -1475,6 +1646,10 @@ function appendDateClauses(clauses: string[], params: unknown[], column: string,
   }
 }
 
+function appendProjectClauses(clauses: string[], _params: unknown[], tableAlias: string): void {
+  clauses.push(`(${tableAlias}.project = ? OR ${tableAlias}.merged_into_project = ?)`);
+}
+
 function appendJsonTextClauses(clauses: string[], params: unknown[], column: string, values: string[]): void {
   if (values.length === 0) return;
   clauses.push(`(${values.map(() => `LOWER(${column}) LIKE ? ESCAPE '\\'`).join(" OR ")})`);
@@ -1483,10 +1658,24 @@ function appendJsonTextClauses(clauses: string[], params: unknown[], column: str
 
 function matchesJsonArrayFilters(values: string[], filters: string[], mode: "exact" | "contains"): boolean {
   if (filters.length === 0) return true;
-  const normalizedValues = values.map(value => value.toLowerCase());
+  const normalizedValues = values.map(value => normalizeFilterValue(value));
   return filters.some(filter => {
-    const normalizedFilter = filter.toLowerCase();
+    const normalizedFilter = normalizeFilterValue(filter);
     return normalizedValues.some(value => mode === "exact" ? value === normalizedFilter : value.includes(normalizedFilter));
+  });
+}
+
+function matchesFileFilters(values: string[], filters: string[], isFolder: boolean): boolean {
+  if (filters.length === 0) return true;
+  const normalizedValues = values.map(value => normalizePathFilterValue(value));
+  return filters.some(filter => {
+    const normalizedFilter = normalizePathFilterValue(filter).replace(/\/+$/g, "");
+    if (!normalizedFilter) return false;
+    if (!isFolder) return normalizedValues.some(value => value.includes(normalizedFilter));
+    return normalizedValues.some(value => {
+      const rest = value.startsWith(`${normalizedFilter}/`) ? value.slice(normalizedFilter.length + 1) : "";
+      return rest.length > 0 && !rest.includes("/");
+    });
   });
 }
 
@@ -1508,6 +1697,73 @@ function compareSearchResults(a: MemorySearchIndexResult, b: MemorySearchIndexRe
     return (aRank ?? Number.POSITIVE_INFINITY) - (bRank ?? Number.POSITIVE_INFINITY) || b.createdAt - a.createdAt || b.id - a.id;
   }
   return b.createdAt - a.createdAt || b.id - a.id;
+}
+
+function normalizeFilterValue(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function normalizePathFilterValue(value: string): string {
+  return normalizeFilterValue(value).replaceAll("\\", "/");
+}
+
+function parseBoolean(value: boolean | string | undefined): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value !== "string") return false;
+  return ["1", "true", "yes", "y"].includes(value.trim().toLowerCase());
+}
+
+function parseStructuredSummary(value: string): StructuredSummary | null {
+  const parsed = parseJsonObject(value);
+  if (!parsed) return null;
+  const keys = ["request", "investigated", "learned", "completed", "next_steps", "files_read", "files_edited", "notes"];
+  if (!keys.some(key => Object.prototype.hasOwnProperty.call(parsed, key))) return null;
+  const summary: StructuredSummary = {
+    request: structuredText(parsed.request),
+    investigated: structuredText(parsed.investigated),
+    learned: structuredText(parsed.learned),
+    completed: structuredText(parsed.completed),
+    next_steps: structuredText(parsed.next_steps),
+    files_read: structuredStringList(parsed.files_read, 80, 240),
+    files_edited: structuredStringList(parsed.files_edited, 80, 240),
+    notes: structuredText(parsed.notes),
+  };
+  return summary.request || summary.investigated || summary.learned || summary.completed || summary.next_steps || summary.notes || summary.files_read.length > 0 || summary.files_edited.length > 0
+    ? summary
+    : null;
+}
+
+function structuredText(value: unknown): string | null {
+  if (typeof value === "string") return nullableTrimmed(value, 2_000);
+  if (Array.isArray(value)) return nullableTrimmed(value.filter((item): item is string => typeof item === "string").join("\n"), 2_000);
+  return null;
+}
+
+function structuredStringList(value: unknown, limit: number, maxLength: number): string[] {
+  const values = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+  return unique(values.filter((item): item is string => typeof item === "string").map(item => clampText(item.trim(), maxLength)).filter(Boolean)).slice(0, limit);
+}
+
+function nullableTrimmed(value: string, maxLength: number): string | null {
+  const trimmed = value.trim();
+  return trimmed ? clampText(trimmed, maxLength) : null;
+}
+
+function buildStructuredSummaryText(summary: StructuredSummary): string {
+  const lines: string[] = [];
+  if (summary.request) lines.push(`Request: ${summary.request}`);
+  if (summary.investigated) lines.push(`Investigated: ${summary.investigated}`);
+  if (summary.learned) lines.push(`Learned: ${summary.learned}`);
+  if (summary.completed) lines.push(`Completed: ${summary.completed}`);
+  if (summary.next_steps) lines.push(`Next steps: ${summary.next_steps}`);
+  if (summary.files_read.length > 0) lines.push(`Files read: ${summary.files_read.join(", ")}`);
+  if (summary.files_edited.length > 0) lines.push(`Files edited: ${summary.files_edited.join(", ")}`);
+  if (summary.notes) lines.push(`Notes: ${summary.notes}`);
+  return clampText(lines.join("\n"), 8_000);
+}
+
+function summaryTitle(row: SessionRow): string {
+  return row.summary;
 }
 
 function escapeLike(value: string): string {

@@ -23,6 +23,9 @@ Claude-mem-compatible replacement memory extension for Oh My Pi / OMP.
 - Stores project memory in SQLite at:
   - `~/.omp/agent/omp-mem/state/<encoded-project-path>/omp-mem.sqlite` by default; set `ompMem.dataDir` to move this root
 - Maintains claude-mem-aligned core columns for sessions, observations, prompts, session summaries, pending ingestion metadata, and observation feedback; daemon-only tables are present for schema compatibility but not used as a worker queue.
+- Uses SQLite FTS for observation titles/subtitles/text/facts/files/concepts and session-summary summary/request/investigation/learning/completion/next-step/notes fields. Direct SQLite inserts into summary rows are indexed through triggers.
+- Stores structured upstream-style session summary fields when the model or caller returns JSON (`request`, `investigated`, `learned`, `completed`, `next_steps`, `files_read`, `files_edited`, `notes`) while keeping `summary` human-readable.
+- Project filters include observations and session summaries adopted into a parent project via `merged_into_project`, which lets worktree memory surface in the requested parent scope.
 
 Private spans wrapped in `<private>...</private>` are stripped before observations are stored.
 
@@ -131,7 +134,7 @@ Supported `~/.omp/agent/omp-mem/settings.json` compatibility aliases include:
 | `CLAUDE_MEM_PROVIDER` / provider model keys | `ai.source`, `ai.omp`, `ai.direct` | Split because OMP itself already has provider/model configuration. Direct mode covers explicit base URL/API key/model. |
 | Worker host/port, MCP server, Python/chroma, Claude Code path, hook timeouts | intentionally omitted | OMP extension runs in-process and exposes tools through OMP; no separate worker, Chroma daemon, Claude Code hook installer, or MCP server is required. |
 | Web UI/version channel/folder `CLAUDE.md` generation | intentionally omitted | User requested no Web UI; `omp-mem` keeps memory files plugin-owned and avoids writing project folder context files. |
-| Token economics display toggles, Chroma/vector search, and last-message injection | intentionally omitted for now | Current store does not persist read/work token economics, does not run a vector daemon, and does not store raw final-message artifacts as first-class context fields. |
+| Token economics display toggles, vector search, and last-message injection | intentionally omitted for now | Current store does not persist read/work token economics, does not run Chroma or any external vector daemon, and does not store raw final-message artifacts as first-class context fields. SQLite/SQLite FTS covers the current no-daemon parity scope. |
 
 `omp-mem` adds OMP-specific knobs not present in claude-mem: `enabled`, capture hook toggles, artifact write toggles, search result caps, private-tag redaction toggle, and optional retention pruning. These exist because OMP extensions can be enabled/disabled and can inject/write artifacts without a separate worker UI.
 
@@ -149,6 +152,7 @@ Common parameters:
 - `obs_type` — observation subtype or record family filter retained for claude-mem compatibility
 - `concept` / `concepts` — concept filter for observations
 - `filePath` / `files` — file filter for observations
+- `isFolder` — when true, treats `filePath` as a folder filter and matches only direct child files such as `src/file.ts`, not nested descendants such as `src/nested/file.ts`.
 - `dateStart` / `dateEnd` — date bounds
 - `limit` / `offset` — pagination
 - `orderBy` — `date_desc`, `date_asc`, or `relevance`
@@ -188,6 +192,7 @@ Common parameters:
 - `metadata` — optional JSON metadata, redacted before storage
 
 The tool stores a `discovery` observation with `tool_name = memory_remember` and applies `<private>...</private>` redaction before writing SQLite, FTS, or artifacts.
+Manual memories are indexed with a `Manual memory` subtitle, so they can be found through the same observation FTS path.
 
 ## Command
 
@@ -262,3 +267,4 @@ Relevant files:
 - Deleting a project state directory removes that project's local memory store and generated artifacts.
 - The extension strips only explicit `<private>...</private>` spans; do not send secrets to tools unless you intend the surrounding non-private context to be recordable.
 - `memory_search` should be used before `memory_get_observations` to avoid loading unnecessary detail into context.
+- Chroma, MCP server, and Web UI remain out of scope for this OMP-native extension; search uses local SQLite FTS plus exact decoded concept/file filters.

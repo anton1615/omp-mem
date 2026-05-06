@@ -40,6 +40,7 @@ interface ExtensionAPI {
       Object(shape: Record<string, unknown>): unknown;
       String(options?: Record<string, unknown>): unknown;
       Number(options?: Record<string, unknown>): unknown;
+      Boolean(options?: Record<string, unknown>): unknown;
       Array(items: unknown, options?: Record<string, unknown>): unknown;
       Optional(schema: unknown): unknown;
       Union?(items: unknown[]): unknown;
@@ -297,6 +298,7 @@ function registerMemoryTools(
       concepts: optionalString("Concept filters as comma-separated values"),
       filePath: optionalString("File path filter"),
       files: optionalString("File filters as comma-separated values"),
+      isFolder: Type.Optional(Type.Boolean({ description: "Treat filePath/files as folder filters and match direct child files only" })),
     }),
     async execute(_toolCallId, params, _onUpdate, ctx) {
       const service = await getService(ctx);
