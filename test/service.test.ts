@@ -111,14 +111,171 @@ test("search returns compact index before details", async () => {
   expect(formatMemorySearchResponse(search)).toContain(`#${authId}`);
 });
 
-test("obs_type prompt filter does not leak tool observations", async () => {
+test("obs_type prompt returns prompt records without leaking tool observations", async () => {
+  const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Fix auth prompt" });
+  await service.recordObservation(makeObservation({ tool_response: "Fixed JWT auth regression in src/auth.ts" }));
+
+  const search = await service.search({ query: "Fix auth", project: "app", obs_type: "prompt", limit: 5 });
+  const record = search.results[0] as unknown as Record<string, unknown>;
+
+  expect(search.total).toBe(1);
+  expect(search.results).toHaveLength(1);
+  expect(record.recordType).toBe("prompt");
+  expect(record.type).toBe("prompt");
+  expect(search.results[0]?.title).toContain("Fix auth prompt");
+  expect(formatMemorySearchResponse(search)).toContain("P1");
+  expect(formatMemorySearchResponse(search)).not.toContain("JWT auth regression");
+});
+
+test("obs_type session returns session summary records without leaking observations", async () => {
   const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
   await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Fix auth" });
-  await service.recordObservation(makeObservation());
+  await service.recordObservation(makeObservation({ tool_response: "Fixed JWT auth regression in src/auth.ts" }));
+  await service.summarizeSession({ contentSessionId: "session-1", summary: "Session summary alpha durable decision." });
 
-  const search = await service.search({ project: "app", obs_type: "prompt", limit: 5 });
+  const search = await service.search({ query: "alpha", project: "app", obs_type: "session", limit: 5 });
+  const record = search.results[0] as unknown as Record<string, unknown>;
 
-  expect(search.results).toEqual([]);
+  expect(search.total).toBe(1);
+  expect(search.results).toHaveLength(1);
+  expect(record.recordType).toBe("session");
+  expect(record.type).toBe("session");
+  expect(search.results[0]?.title).toContain("Session summary alpha");
+  expect(formatMemorySearchResponse(search)).toContain("S1");
+  expect(formatMemorySearchResponse(search)).not.toContain("JWT auth regression");
+});
+
+test("search total counts all matching records before pagination", async () => {
+  const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Fix auth" });
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-1", tool_response: "auth first detail" }));
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-2", tool_response: "auth second detail" }));
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-3", tool_response: "auth third detail" }));
+
+  const search = await service.search({ query: "auth", project: "app", obs_type: "observation", limit: 1 });
+
+  expect(search.results).toHaveLength(1);
+  expect(search.total).toBe(3);
+});
+
+test("search with FTS query honors explicit date_desc order", async () => {
+  const service = await createTrackedService({
+    memoryRoot: tempRoot,
+    now: (() => {
+      let current = 1_700_000_000;
+      return () => current++;
+    })(),
+  });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Fix auth" });
+  const older = await service.recordObservation(makeObservation({ tool_use_id: "tool-older", tool_response: "auth auth auth older detail" }));
+  const newer = await service.recordObservation(makeObservation({ tool_use_id: "tool-newer", tool_response: "auth newer detail" }));
+
+  const search = await service.search({ query: "auth", project: "app", obs_type: "observation", orderBy: "date_desc", limit: 2 });
+
+  expect(search.results.map(result => result.id)).toEqual([newer, older]);
+});
+
+test("initializes claude-mem aligned core schema columns", async () => {
+  const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
+
+  const observationColumns = new Set((service.db.prepare("PRAGMA table_info(observations)").all() as Array<{ name: string }>).map(row => row.name));
+  const summaryColumns = new Set((service.db.prepare("PRAGMA table_info(session_summaries)").all() as Array<{ name: string }>).map(row => row.name));
+  const sessionColumns = new Set((service.db.prepare("PRAGMA table_info(sdk_sessions)").all() as Array<{ name: string }>).map(row => row.name));
+
+  expect(observationColumns).toContain("memory_session_id");
+  expect(observationColumns).toContain("content_hash");
+  expect(observationColumns).toContain("agent_type");
+  expect(observationColumns).toContain("agent_id");
+  expect(observationColumns).toContain("generated_by_model");
+  expect(observationColumns).toContain("metadata");
+  expect(summaryColumns).toContain("request");
+  expect(summaryColumns).toContain("investigated");
+  expect(summaryColumns).toContain("learned");
+  expect(summaryColumns).toContain("completed");
+  expect(summaryColumns).toContain("next_steps");
+  expect(sessionColumns).toContain("status");
+  expect(sessionColumns).toContain("prompt_counter");
+});
+
+test("remember stores manual memory as redacted discovery observation", async () => {
+  const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
+
+  const id = await (service as unknown as {
+    remember(request: { text: string; title?: string; project?: string; metadata?: Record<string, unknown> }): Promise<number>;
+  }).remember({
+    text: "Manual memory alpha <private>secret</private>",
+    title: "Manual alpha",
+    project: "app",
+    metadata: { source: "test" },
+  });
+  const observation = (await service.getObservations({ ids: [id], project: "app" })).observations[0];
+
+  expect(observation?.type).toBe("discovery");
+  expect(observation?.toolName).toBe("memory_remember");
+  expect(observation?.title).toBe("Manual alpha");
+  expect(observation?.narrative).toContain("Manual memory alpha");
+  expect(observation?.narrative).not.toContain("secret");
+});
+
+test("remember redacts project and metadata keys before SQLite storage", async () => {
+  const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
+
+  const id = await service.remember({
+    text: "Manual memory gamma",
+    project: "<private>secret-project</private>",
+    metadata: {
+      project: "<private>secret-metadata-project</private>",
+      "<private>secret-key</private>": "<private>secret-value</private>",
+    },
+  });
+  const session = service.db.prepare("SELECT content_session_id, project, memory_session_id FROM sdk_sessions").get() as Record<string, string>;
+  const row = service.db.prepare("SELECT project, metadata FROM observations WHERE id = ?").get(id) as Record<string, string>;
+
+  expect(JSON.stringify(session)).not.toContain("secret");
+  expect(JSON.stringify(row)).not.toContain("secret");
+  expect(session.project).toContain("[private redacted]");
+  expect(row.project).toContain("[private redacted]");
+  expect(row.metadata).toContain("[private redacted]");
+});
+
+test("timeline supports session anchors and merges prompts observations summaries", async () => {
+  const service = await createTrackedService({
+    memoryRoot: tempRoot,
+    now: (() => {
+      let current = 1_700_000_000;
+      return () => current++;
+    })(),
+  });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Prompt timeline alpha" });
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-timeline", tool_response: "Fixed observation timeline alpha" }));
+  await service.summarizeSession({ contentSessionId: "session-1", summary: "Summary timeline alpha" });
+
+  const timeline = await service.timeline({ anchor: "S1", depth_before: 2, depth_after: 2, project: "app" });
+  const formatted = formatMemoryTimelineResponse(timeline);
+
+  expect(timeline.anchor).toBe("S1");
+  expect(formatted).toContain("P1 [prompt] Prompt timeline alpha");
+  expect(formatted).toContain("#1 [bugfix]");
+  expect(formatted).toContain("* S1 [session] Summary timeline alpha");
+});
+
+test("timeline resolves session anchor without repeated project", async () => {
+  const service = await createTrackedService({
+    memoryRoot: tempRoot,
+    now: (() => {
+      let current = 1_700_000_000;
+      return () => current++;
+    })(),
+  });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Prompt timeline beta" });
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-timeline-beta", tool_response: "Fixed observation timeline beta" }));
+  await service.summarizeSession({ contentSessionId: "session-1", summary: "Summary timeline beta" });
+
+  const timeline = await service.timeline({ anchor: "S1", depth_before: 2, depth_after: 0 });
+
+  expect(timeline.anchor).toBe("S1");
+  expect(formatMemoryTimelineResponse(timeline)).toContain("Summary timeline beta");
 });
 
 test("timeline centers chronological context around an observation", async () => {
@@ -136,6 +293,63 @@ test("timeline centers chronological context around an observation", async () =>
   expect(timeline.anchor).toBe(second);
   expect(timeline.items.map(item => item.id)).toEqual([first, second, third]);
   expect(formatMemoryTimelineResponse(timeline)).toContain("Fixed auth failure");
+});
+
+test("search concept and file filters handle literal underscores", async () => {
+  const service = await createTrackedService({
+    memoryRoot: tempRoot,
+    now: () => 1_700_000_000,
+    extractObservation: async () => ({
+      title: "Literal underscore memory",
+      narrative: "Literal underscore detail",
+      type: "discovery",
+      concepts: ["foo_bar"],
+      files: ["src/foo_bar.ts"],
+    }),
+  });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Filter underscores" });
+  const id = await service.recordObservation(makeObservation({ tool_response: "underscore" }));
+
+  const byConcept = await service.search({ project: "app", obs_type: "observation", concept: "foo_bar" });
+  const byFile = await service.search({ project: "app", obs_type: "observation", filePath: "src/foo_bar.ts" });
+
+  expect(byConcept.results.map(result => result.id)).toEqual([id]);
+  expect(byFile.results.map(result => result.id)).toEqual([id]);
+});
+
+test("search concept and file filters handle JSON escaped backslashes and percent signs", async () => {
+  const service = await createTrackedService({
+    memoryRoot: tempRoot,
+    now: () => 1_700_000_000,
+    extractObservation: async () => ({
+      title: "Escaped literal memory",
+      narrative: "Escaped literal detail",
+      type: "discovery",
+      concepts: ["foo%bar", "path\\segment"],
+      files: ["src\\foo%bar.ts"],
+    }),
+  });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Filter escaped literals" });
+  const id = await service.recordObservation(makeObservation({ tool_response: "escaped" }));
+
+  const byPercentConcept = await service.search({ project: "app", obs_type: "observation", concept: "foo%bar" });
+  const byBackslashConcept = await service.search({ project: "app", obs_type: "observation", concept: "path\\segment" });
+  const byBackslashFile = await service.search({ project: "app", obs_type: "observation", filePath: "src\\foo%bar.ts" });
+
+  expect(byPercentConcept.results.map(result => result.id)).toEqual([id]);
+  expect(byBackslashConcept.results.map(result => result.id)).toEqual([id]);
+  expect(byBackslashFile.results.map(result => result.id)).toEqual([id]);
+});
+
+test("unknown obs_type returns no records instead of broad observation search", async () => {
+  const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Unknown filter" });
+  await service.recordObservation(makeObservation({ tool_response: "Unknown filter should not leak all records" }));
+
+  const search = await service.search({ project: "app", obs_type: "not-a-type" });
+
+  expect(search.total).toBe(0);
+  expect(search.results).toEqual([]);
 });
 
 test("context injection writes compatible memory artifacts", async () => {
@@ -301,35 +515,55 @@ test("recordObservation prefers configured model extraction over heuristic field
   expect(observation?.confidence).toBe("inferred");
 });
 
-test("recordObservation redacts extracted files and concepts", async () => {
+test("recordObservation redacts and bounds extracted metadata lists", async () => {
+  const longFile = `src/${"a".repeat(260)}.ts`;
+  const longConcept = `concept-${"b".repeat(140)}`;
+  const longFact = `fact ${"c".repeat(260)}`;
   const service = await createTrackedService({
     memoryRoot: tempRoot,
     now: () => 1_700_000_000,
     extractObservation: async () => ({
       title: "Safe title",
       narrative: "Safe narrative",
-      files: ["src/auth.ts", "<private>secret/path.ts</private>"],
-      concepts: ["auth", "<private>secret concept</private>"],
-      facts: ["safe fact"],
+      files: ["src/auth.ts", "<private>secret/path.ts</private>", longFile, ...Array.from({ length: 20 }, (_, index) => `src/file-${index}.ts`)],
+      concepts: ["auth", "<private>secret concept</private>", longConcept, ...Array.from({ length: 35 }, (_, index) => `concept-${index}`)],
+      facts: ["safe fact", "<private>secret fact</private>", longFact, ...Array.from({ length: 15 }, (_, index) => `fact ${index}`)],
     }),
   });
   await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Fix auth" });
 
   const id = await service.recordObservation(makeObservation());
   const observation = (await service.getObservations({ ids: [id] })).observations[0];
+  const row = service.db.prepare("SELECT facts, files_read, concepts FROM observations WHERE id = ?").get(id) as Record<string, string>;
+  const fts = service.db.prepare("SELECT facts, files, concepts FROM observations_fts WHERE rowid = ?").get(id) as Record<string, string>;
 
-  expect(observation?.files.join(" ")).not.toContain("secret");
-  expect(observation?.concepts.join(" ")).not.toContain("secret");
+  expect(observation?.files).toHaveLength(20);
+  expect(observation?.concepts).toHaveLength(30);
+  expect(observation?.facts).toHaveLength(12);
+  expect(observation?.files.every(file => file.length <= 240)).toBe(true);
+  expect(observation?.concepts.every(concept => concept.length <= 120)).toBe(true);
+  expect(observation?.facts.every(fact => fact.length <= 240)).toBe(true);
+  expect(JSON.stringify({ observation, row, fts })).toContain("[private redacted]");
+  expect(JSON.stringify({ observation, row, fts })).not.toContain("secret");
 });
 
-test("summarizeSession accepts injected summary without raw assistant text", async () => {
+test("summarizeSession redacts and clamps injected summary without raw assistant text", async () => {
   const service = await createTrackedService({ memoryRoot: tempRoot, now: () => 1_700_000_000 });
   await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Fix auth" });
 
-  await service.summarizeSession({ contentSessionId: "session-1", summary: "Injected session summary." });
+  await service.summarizeSession({
+    contentSessionId: "session-1",
+    summary: `Injected <private>secret summary</private> ${"x".repeat(8_100)}`,
+    last_assistant_message: "Raw assistant unsafe needle should not be persisted",
+  });
 
-  const row = service.db.prepare("SELECT summary FROM session_summaries WHERE content_session_id = ?").get("session-1") as { summary: string } | undefined;
-  expect(row?.summary).toBe("Injected session summary.");
+  const row = service.db.prepare("SELECT summary, request FROM session_summaries WHERE content_session_id = ?").get("session-1") as { summary: string; request: string | null } | undefined;
+  const search = await service.search({ query: "unsafe needle", project: "app", obs_type: "session", limit: 5 });
+  expect(row?.summary).toContain("[private redacted]");
+  expect(row?.summary).not.toContain("secret");
+  expect(row?.request).toBe(null);
+  expect(JSON.stringify({ row, search })).not.toContain("unsafe needle");
+  expect((row?.summary.length ?? 0) <= 8_000).toBe(true);
 });
 
 test("flushArtifacts honors artifact max above public search cap", async () => {

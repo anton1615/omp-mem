@@ -61,6 +61,12 @@ declare module "node:path" {
   export function dirname(filePath: string): string;
 }
 
+declare module "node:crypto" {
+  export function createHash(algorithm: string): {
+    update(data: string): { digest(encoding: "hex"): string };
+  };
+}
+
 declare const process: {
   cwd(): string;
   env?: Record<string, string | undefined>;

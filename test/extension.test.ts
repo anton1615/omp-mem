@@ -92,8 +92,27 @@ test("registers claude-mem compatible memory tools", async () => {
 
   await registerOmpMemExtension(fake.api, { memoryRoot: tempRoot, dbPath: ":memory:", now: () => 1_700_000_000 });
 
-  expect([...fake.tools.keys()].sort()).toEqual(["memory_get_observations", "memory_search", "memory_timeline"]);
+  expect([...fake.tools.keys()].sort()).toEqual(["memory_get_observations", "memory_remember", "memory_search", "memory_timeline"]);
   expect(fake.commands.has("mem")).toBe(true);
+});
+
+test("memory_remember stores manual memory through local tool", async () => {
+  const fake = createFakeApi();
+  const ctx = createContext();
+  await registerOmpMemExtension(fake.api, { memoryRoot: tempRoot, dbPath: ":memory:", now: () => 1_700_000_000 });
+
+  const remember = await fake.tools.get("memory_remember")?.execute("remember-1", {
+    text: "Manual memory beta <private>secret</private>",
+    title: "Manual beta",
+    project: "app",
+    metadata: { source: "extension-test" },
+  }, undefined, ctx);
+  const details = await fake.tools.get("memory_get_observations")?.execute("details-1", { ids: [1], project: "app" }, undefined, ctx);
+
+  expect(remember?.content[0]?.text).toContain("Memory saved as observation #1");
+  expect(details?.content[0]?.text).toContain("Manual beta");
+  expect(details?.content[0]?.text).toContain("Manual memory beta");
+  expect(details?.content[0]?.text).not.toContain("secret");
 });
 
 test("captures OMP prompt and tool_execution_end events then exposes progressive search", async () => {

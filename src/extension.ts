@@ -99,7 +99,7 @@ interface ToolDefinition {
   ): Promise<{ content: Array<{ type: "text"; text: string }>; details?: unknown }>;
 }
 
-const SELF_TOOL_NAMES = new Set(["memory_search", "memory_timeline", "memory_get_observations"]);
+const SELF_TOOL_NAMES = new Set(["memory_search", "memory_timeline", "memory_get_observations", "memory_remember"]);
 
 export default async function ompMemExtension(pi: ExtensionAPI): Promise<void> {
   await registerOmpMemExtension(pi);
@@ -293,6 +293,10 @@ function registerMemoryTools(
       dateStart: optionalString("Start date YYYY-MM-DD"),
       dateEnd: optionalString("End date YYYY-MM-DD"),
       orderBy: optionalString("date_desc, date_asc, or relevance"),
+      concept: optionalString("Concept filter or comma-separated concepts"),
+      concepts: optionalString("Concept filters as comma-separated values"),
+      filePath: optionalString("File path filter"),
+      files: optionalString("File filters as comma-separated values"),
     }),
     async execute(_toolCallId, params, _onUpdate, ctx) {
       const service = await getService(ctx);
@@ -335,6 +339,36 @@ function registerMemoryTools(
       const service = await getService(ctx);
       const response = await service.getObservations(params as unknown as GetObservationsRequest);
       return { content: [{ type: "text", text: formatMemoryGetResponse(response) }], details: response };
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_remember",
+    label: "Remember Memory",
+    description:
+      "Save a durable manual memory as a redacted discovery observation in omp-mem. Use for explicit user-approved facts, preferences, or decisions.",
+    parameters: Type.Object({
+      text: Type.String({ description: "Memory text to save" }),
+      title: optionalString("Optional short title"),
+      project: optionalString("Project filter/name; defaults to current project"),
+      metadata: Type.Optional(Type.Object({})),
+    }),
+    async execute(_toolCallId, params, _onUpdate, ctx) {
+      const service = await getService(ctx);
+      const text = typeof params.text === "string" ? params.text : "";
+      if (!text.trim()) return { content: [{ type: "text", text: "Memory text is required." }] };
+      const metadata = params.metadata && typeof params.metadata === "object" && !Array.isArray(params.metadata)
+        ? params.metadata as Record<string, unknown>
+        : undefined;
+      const project = typeof params.project === "string" ? params.project : (ctx ? getProjectName(ctx) : undefined);
+      const id = await service.remember({
+        text,
+        title: typeof params.title === "string" ? params.title : undefined,
+        project,
+        metadata,
+      });
+      await service.flushArtifacts(project);
+      return { content: [{ type: "text", text: `Memory saved as observation #${id}` }], details: { id } };
     },
   });
 }

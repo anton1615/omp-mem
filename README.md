@@ -2,7 +2,7 @@
 
 Claude-mem-compatible replacement memory extension for Oh My Pi / OMP.
 
-`omp-mem` records OMP session context, prompts, tool observations, compact events, and session summaries into a project-scoped SQLite store. It exposes the familiar progressive memory workflow through `memory_search`, `memory_timeline`, and `memory_get_observations`, then injects a compact memory summary into future agent turns.
+`omp-mem` records OMP session context, prompts, tool observations, compact events, manual memories, and session summaries into a project-scoped SQLite store. It exposes the familiar progressive memory workflow through `memory_search`, `memory_timeline`, and `memory_get_observations`, adds `memory_remember` for explicit saves, then injects a compact memory summary into future agent turns.
 
 ## Compatibility
 
@@ -16,11 +16,13 @@ Claude-mem-compatible replacement memory extension for Oh My Pi / OMP.
 - Records tool results from `tool_result` and `tool_execution_end`, deduplicating the same tool call when both events fire.
 - Skips recording its own memory tools to avoid feedback loops.
 - Records `session_compact` entries as observations.
+- Records manual memories through `memory_remember` using the same redaction and observation store.
 - Writes compatible artifacts:
   - `memory_summary.md`
   - `MEMORY.md`
 - Stores project memory in SQLite at:
   - `~/.omp/agent/omp-mem/state/<encoded-project-path>/omp-mem.sqlite` by default; set `ompMem.dataDir` to move this root
+- Maintains claude-mem-aligned core columns for sessions, observations, prompts, session summaries, pending ingestion metadata, and observation feedback; daemon-only tables are present for schema compatibility but not used as a worker queue.
 
 Private spans wrapped in `<private>...</private>` are stripped before observations are stored.
 
@@ -57,6 +59,7 @@ ompMem:
       - memory_search
       - memory_timeline
       - memory_get_observations
+      - memory_remember
       - todo_write
       - ask
   context:
@@ -106,7 +109,7 @@ Supported `~/.omp/agent/omp-mem/settings.json` compatibility aliases include:
   "CLAUDE_MEM_CONTEXT_OBSERVATION_CONCEPTS": "how-it-works,gotcha",
   "CLAUDE_MEM_CONTEXT_FULL_COUNT": "5",
   "CLAUDE_MEM_CONTEXT_FULL_FIELD": "narrative",
-  "CLAUDE_MEM_SKIP_TOOLS": "memory_search,memory_timeline,memory_get_observations"
+  "CLAUDE_MEM_SKIP_TOOLS": "memory_search,memory_timeline,memory_get_observations,memory_remember"
 }
 ```
 
@@ -124,10 +127,11 @@ Supported `~/.omp/agent/omp-mem/settings.json` compatibility aliases include:
 | `CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY` | `context.includeSummary` | Supported through generated `memory_summary.md` plus recent session summaries. |
 | `CLAUDE_MEM_DATA_DIR` | `dataDir` | Supported but defaults to OMP-owned `~/.omp/agent/omp-mem`. |
 | `CLAUDE_MEM_SKIP_TOOLS` | `capture.skipTools` | Supported with OMP tool names. |
+| `POST /api/memory/save` | `memory_remember` | Implemented as an in-process OMP tool instead of an HTTP route. Stores a redacted manual `discovery` observation. |
 | `CLAUDE_MEM_PROVIDER` / provider model keys | `ai.source`, `ai.omp`, `ai.direct` | Split because OMP itself already has provider/model configuration. Direct mode covers explicit base URL/API key/model. |
 | Worker host/port, MCP server, Python/chroma, Claude Code path, hook timeouts | intentionally omitted | OMP extension runs in-process and exposes tools through OMP; no separate worker, Chroma daemon, Claude Code hook installer, or MCP server is required. |
 | Web UI/version channel/folder `CLAUDE.md` generation | intentionally omitted | User requested no Web UI; `omp-mem` keeps memory files plugin-owned and avoids writing project folder context files. |
-| Token economics display toggles and last-message injection | intentionally omitted for now | Current store does not persist read/work token economics or raw final-message artifacts as first-class context fields. |
+| Token economics display toggles, Chroma/vector search, and last-message injection | intentionally omitted for now | Current store does not persist read/work token economics, does not run a vector daemon, and does not store raw final-message artifacts as first-class context fields. |
 
 `omp-mem` adds OMP-specific knobs not present in claude-mem: `enabled`, capture hook toggles, artifact write toggles, search result caps, private-tag redaction toggle, and optional retention pruning. These exist because OMP extensions can be enabled/disabled and can inject/write artifacts without a separate worker UI.
 
@@ -135,26 +139,29 @@ Supported `~/.omp/agent/omp-mem/settings.json` compatibility aliases include:
 
 ### `memory_search`
 
-Step 1 of the progressive lookup flow. It returns compact matching IDs only, so the agent can filter before loading details.
+Step 1 of the progressive lookup flow. It returns compact matching IDs only, so the agent can filter before loading details. Observation search is the default for backward compatibility; request `obs_type: prompt` or `obs_type: session` to search captured prompts or session summaries.
 
 Common parameters:
 
 - `query` — full-text search query
 - `project` — project filter
-- `type` / `obs_type` — observation filters
+- `type` — observation subtype filter, or a record family such as `observation`, `session`, or `prompt`
+- `obs_type` — observation subtype or record family filter retained for claude-mem compatibility
+- `concept` / `concepts` — concept filter for observations
+- `filePath` / `files` — file filter for observations
 - `dateStart` / `dateEnd` — date bounds
 - `limit` / `offset` — pagination
 - `orderBy` — `date_desc`, `date_asc`, or `relevance`
 
 ### `memory_timeline`
 
-Step 2. It returns chronological context around an anchor ID or around the best match for a query.
+Step 2. It returns chronological context around an anchor ID or around the best match for a query. Numeric anchors refer to observations; `S<id>` anchors session summaries; `P<id>` anchors captured prompts.
 
 Common parameters:
 
-- `anchor` — observation ID
-- `query` — search query used to choose an anchor
-- `depth_before` / `depth_after` — surrounding observations to include
+- `anchor` — observation ID, `S<summary-id>`, `P<prompt-id>`, or timestamp
+- `query` — search query used to choose an observation anchor
+- `depth_before` / `depth_after` — surrounding records to include
 - `project` — project filter
 
 ### `memory_get_observations`
@@ -167,6 +174,20 @@ Common parameters:
 - `project` — project filter
 - `limit` — maximum observations
 - `orderBy` — `date_desc` or `date_asc`
+
+
+### `memory_remember`
+
+Manual save path corresponding to claude-mem's memory-save API, exposed as an OMP tool instead of HTTP.
+
+Common parameters:
+
+- `text` — durable memory text to save
+- `title` — optional short title
+- `project` — optional project name; defaults to current project
+- `metadata` — optional JSON metadata, redacted before storage
+
+The tool stores a `discovery` observation with `tool_name = memory_remember` and applies `<private>...</private>` redaction before writing SQLite, FTS, or artifacts.
 
 ## Command
 

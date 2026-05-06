@@ -88,6 +88,7 @@ export const DEFAULT_OMP_MEM_CONFIG: OmpMemConfig = Object.freeze({
       "memory_search",
       "memory_timeline",
       "memory_get_observations",
+      "memory_remember",
       "todo_write",
       "ask",
     ]) as string[],
