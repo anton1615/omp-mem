@@ -63,6 +63,7 @@ declare module "node:path" {
 
 declare const process: {
   cwd(): string;
+  env?: Record<string, string | undefined>;
 };
 
 declare const Bun: {

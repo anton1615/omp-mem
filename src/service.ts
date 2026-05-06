@@ -375,6 +375,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     this.db
       .prepare("INSERT INTO observations_fts (rowid, title, narrative, facts, files, concepts) VALUES (?, ?, ?, ?, ?, ?)")
       .run(id, title, narrative, facts.join(" "), files.join(" "), concepts.join(" "));
+    this.applyRetention(project);
     return id;
   }
 
@@ -524,12 +525,12 @@ LIMIT ?
 
   async injectContext(request: ContextInjectRequest): Promise<string> {
     if (!this.config.context.enabled) return "";
-    const search = await this.search({ query: request.q, project: request.project, limit: request.limit ?? this.config.context.observations });
+    const finalLimit = parseLimit(request.limit, this.config.context.observations, this.config.search.maxLimit);
+    const contextResults = this.searchContextIndex(request, finalLimit);
     const sessionSummaries = this.getRecentSessionSummaries(request.project, this.config.context.sessions);
     const fullDetails = this.config.context.fullCount > 0
       ? await this.getObservations({
-        ids: search.results.slice(0, this.config.context.fullCount).map(result => result.id),
-        orderBy: "date_desc",
+        ids: contextResults.slice(0, this.config.context.fullCount).map(result => result.id),
         project: request.project,
       })
       : { observations: [] };
@@ -550,9 +551,9 @@ LIMIT ?
       }
       lines.push("");
     }
-    if (search.results.length > 0) {
+    if (contextResults.length > 0) {
       lines.push("## Relevant memory index");
-      for (const result of search.results) {
+      for (const result of contextResults) {
         lines.push(`- #${result.id} [${result.type}] ${result.title}`);
       }
       lines.push("Use memory_get_observations with filtered IDs before relying on details.");
@@ -560,10 +561,8 @@ LIMIT ?
     if (fullDetails.observations.length > 0) {
       lines.push("", "## Full memory details");
       for (const observation of fullDetails.observations) {
-        const facts = observation.facts.map(fact => `  - ${fact}`).join("\n");
-        const files = observation.files.length > 0 ? `\nFiles: ${observation.files.join(", ")}` : "";
         lines.push(`#${observation.id} [${observation.type}] ${observation.title}`);
-        lines.push(`${observation.narrative}${files}${facts ? `\nFacts:\n${facts}` : ""}`);
+        lines.push(formatFullContextObservation(observation, this.config.context.fullField));
       }
     }
     return lines.join("\n").trim();
@@ -597,6 +596,52 @@ LIMIT ?
 `)
       .all(...params, safeLimit) as ObservationRow[];
     return rows.map(rowToObservation);
+  }
+
+  private searchContextIndex(request: ContextInjectRequest, limit: number): MemorySearchIndexResult[] {
+    const query = sanitizeFtsQuery(request.q);
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (request.project) {
+      clauses.push("o.project = ?");
+      params.push(request.project);
+    }
+    if (this.config.context.types.length === 1) {
+      clauses.push("o.type = ?");
+      params.push(this.config.context.types[0]);
+    } else if (this.config.context.types.length > 1) {
+      clauses.push(`o.type IN (${this.config.context.types.map(() => "?").join(", ")})`);
+      params.push(...this.config.context.types);
+    }
+
+    const rows = query
+      ? this.db
+        .prepare(`
+SELECT o.id, o.created_at, o.project, o.type, o.title, o.narrative, o.files_json, o.concepts_json, o.confidence
+FROM observations_fts f
+JOIN observations o ON o.id = f.rowid
+WHERE observations_fts MATCH ?${clauses.length > 0 ? ` AND ${clauses.join(" AND ")}` : ""}
+ORDER BY rank, o.created_at DESC, o.id DESC
+`)
+        .all(query, ...params) as SearchRow[]
+      : this.db
+        .prepare(`
+SELECT o.id, o.created_at, o.project, o.type, o.title, o.narrative, o.files_json, o.concepts_json, o.confidence
+FROM observations o
+${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
+ORDER BY o.created_at DESC, o.id DESC
+`)
+        .all(...params) as SearchRow[];
+
+    return filterContextResults(rows.map(row => ({
+      id: row.id,
+      createdAt: row.created_at,
+      project: row.project,
+      type: row.type,
+      title: row.title,
+      files: parseJsonArray(row.files_json),
+      concepts: parseJsonArray(row.concepts_json),
+    })), [], this.config.context.concepts).slice(0, limit);
   }
 
   close(): void {
@@ -635,7 +680,7 @@ LIMIT ?
   }
 
   private async extractObservationSafe(request: ObservationExtractionRequest): Promise<ObservationExtractionResult | undefined> {
-    if (!this.extractObservation || this.config.ai.provider !== "omp") return undefined;
+    if (!this.extractObservation || this.config.ai.source === "heuristic") return undefined;
     try {
       return await this.extractObservation(request);
     } catch (error) {
@@ -645,7 +690,7 @@ LIMIT ?
   }
 
   private async summarizeTextSafe(request: SessionSummaryRequest): Promise<string | undefined> {
-    if (!this.summarizeText || this.config.ai.provider !== "omp") return undefined;
+    if (!this.summarizeText || this.config.ai.source === "heuristic") return undefined;
     try {
       const summary = await this.summarizeText(request);
       return summary?.trim() ? summary : undefined;
@@ -674,6 +719,47 @@ LIMIT ?
 `)
       .all(...params, limit) as SessionSummaryRow[];
   }
+
+  private applyRetention(project: string): void {
+    const idsToDelete: number[] = [];
+    if (this.config.retention.pruneDays !== null) {
+      const cutoff = this.now() - this.config.retention.pruneDays * 86_400;
+      const rows = this.db
+        .prepare("SELECT id FROM observations WHERE project = ? AND created_at < ?")
+        .all(project, cutoff) as Array<{ id: number }>;
+      idsToDelete.push(...rows.map(row => row.id));
+    }
+    if (this.config.retention.maxObservations !== null) {
+      const rows = this.db
+        .prepare(`
+SELECT id FROM observations
+WHERE project = ?
+ORDER BY created_at DESC, id DESC
+LIMIT -1 OFFSET ?
+`)
+        .all(project, this.config.retention.maxObservations) as Array<{ id: number }>;
+      idsToDelete.push(...rows.map(row => row.id));
+    }
+    this.deleteObservations(uniqueNumbers(idsToDelete));
+  }
+
+  private deleteObservations(ids: number[]): void {
+    if (ids.length === 0) return;
+    const placeholders = ids.map(() => "?").join(", ");
+    this.db.prepare(`DELETE FROM observations WHERE id IN (${placeholders})`).run(...ids);
+    this.rebuildFtsIndex();
+  }
+
+  private rebuildFtsIndex(): void {
+    this.db.prepare("INSERT INTO observations_fts(observations_fts) VALUES('delete-all')").run();
+    const rows = this.db
+      .prepare("SELECT id, title, narrative, facts_json, files_json, concepts_json FROM observations")
+      .all() as Array<{ id: number; title: string; narrative: string; facts_json: string; files_json: string; concepts_json: string }>;
+    const insert = this.db.prepare("INSERT INTO observations_fts (rowid, title, narrative, facts, files, concepts) VALUES (?, ?, ?, ?, ?, ?)");
+    for (const row of rows) {
+      insert.run(row.id, row.title, row.narrative, parseJsonArray(row.facts_json).join(" "), parseJsonArray(row.files_json).join(" "), parseJsonArray(row.concepts_json).join(" "));
+    }
+  }
 }
 
 export function formatMemorySearchResponse(response: MemorySearchResponse): string {
@@ -701,6 +787,26 @@ export function formatMemoryGetResponse(response: MemoryGetResponse): string {
       return `#${item.id} [${item.type}] ${item.title}\n${item.narrative}${files}${facts ? `\nFacts:\n${facts}` : ""}`;
     })
     .join("\n\n");
+}
+
+function filterContextResults(results: MemorySearchIndexResult[], types: string[], concepts: string[]): MemorySearchIndexResult[] {
+  const typeSet = new Set(types.map(type => type.toLowerCase()));
+  const conceptSet = new Set(concepts.map(concept => concept.toLowerCase()));
+  return results.filter(result => {
+    if (typeSet.size > 0 && !typeSet.has(result.type.toLowerCase())) return false;
+    if (conceptSet.size > 0 && !result.concepts.some(concept => conceptSet.has(concept.toLowerCase()))) return false;
+    return true;
+  });
+}
+
+function formatFullContextObservation(observation: MemoryObservation, fullField: "narrative" | "facts"): string {
+  const files = observation.files.length > 0 ? `\nFiles: ${observation.files.join(", ")}` : "";
+  if (fullField === "facts") {
+    const facts = observation.facts.map(fact => `  - ${fact}`).join("\n");
+    return `${facts ? `Facts:\n${facts}` : "Facts: none captured"}${files}`;
+  }
+  const facts = observation.facts.map(fact => `  - ${fact}`).join("\n");
+  return `${observation.narrative}${files}${facts ? `\nFacts:\n${facts}` : ""}`;
 }
 
 function rowToObservation(row: ObservationRow): MemoryObservation {
@@ -879,6 +985,10 @@ function clampText(text: string, maxLength: number): string {
 
 function unique(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))];
+}
+
+function uniqueNumbers(values: number[]): number[] {
+  return [...new Set(values.filter(value => Number.isInteger(value) && value > 0))];
 }
 
 function dateToUnix(value: string, endOfDay = false): number {

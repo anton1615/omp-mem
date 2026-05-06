@@ -4,6 +4,12 @@ Claude-mem-compatible replacement memory extension for Oh My Pi / OMP.
 
 `omp-mem` records OMP session context, prompts, tool observations, compact events, and session summaries into a project-scoped SQLite store. It exposes the familiar progressive memory workflow through `memory_search`, `memory_timeline`, and `memory_get_observations`, then injects a compact memory summary into future agent turns.
 
+## Compatibility
+
+- Supported OMP version: `>= 14.7.0`.
+- This extension uses the OMP 14.7.0 `systemPrompt: string[]` hook contract for `before_agent_start` context injection.
+- OMP versions before 14.7.0 used the legacy `systemPrompt: string` contract and are not supported by this branch. Use an older `omp-mem` revision if you need to run on pre-14.7.0 OMP.
+
 ## What it does
 
 - Captures session starts and user prompts through OMP lifecycle events.
@@ -30,10 +36,18 @@ ompMem:
   dataDir: auto
   mode: code
   ai:
-    provider: omp        # "omp" uses OMP's model registry; "heuristic" disables model calls
-    model: current       # current, canonical ID, or provider/model-id
+    source: omp          # omp, direct, or heuristic
     maxTokens: 1024
-    failOpen: true       # fall back to heuristic extraction if the model call fails
+    failOpen: true       # fall back to heuristic extraction if model work fails
+    omp:
+      provider: current  # current, or an OMP provider id such as cliproxyapi
+      model: current     # current, or a model id within that OMP provider
+    direct:
+      api: openai-chat   # OpenAI-compatible /chat/completions
+      baseUrl: ""        # e.g. https://openrouter.ai/api/v1
+      apiKeyEnv: OMP_MEM_DIRECT_API_KEY
+      model: ""
+      headers: {}
   capture:
     prompts: true
     tools: true
@@ -49,7 +63,10 @@ ompMem:
     enabled: true
     observations: 50
     sessions: 10
+    types: []
+    concepts: []
     fullCount: 5
+    fullField: narrative # narrative or facts
     includeSummary: true
   artifacts:
     enabled: true
@@ -65,24 +82,54 @@ ompMem:
 
 ### Model-based compression
 
-With `ai.provider: omp`, the extension can use an OMP model to extract durable observations and summarize session-end assistant output. It resolves the configured model from the active OMP context/model registry, obtains the provider API key through `ctx.modelRegistry.getApiKey(...)`, and calls `@oh-my-pi/pi-ai` for a compact JSON observation or markdown session summary.
+`ai.source` intentionally separates model selection into two paths:
 
-If no model/API key is available or the model call fails while `failOpen: true`, `omp-mem` stores a deterministic heuristic observation instead of blocking the agent turn.
+| Source | Required fields | Behavior |
+|---|---|---|
+| `omp` | `ai.omp.provider`, `ai.omp.model` | Uses OMP's configured providers, credentials, model registry, and default/inherited thinking settings. Use `current/current` to follow the active conversation model. |
+| `direct` | `ai.direct.baseUrl`, `ai.direct.apiKey` or `apiKeyEnv`, `ai.direct.model` | Calls an OpenAI-compatible `/chat/completions` endpoint directly. This is for providers not configured in OMP. |
+| `heuristic` | none | Disables model calls and uses deterministic local extraction only. |
+
+`omp-mem` does not expose a thinking-effort setting for memory compression. When `source: omp`, thinking behavior is inherited from OMP/model defaults; when `source: direct`, no thinking parameter is sent.
 
 Supported `~/.omp/agent/omp-mem/settings.json` compatibility aliases include:
 
 ```json
 {
-  "CLAUDE_MEM_MODEL": "google/gemini-2.5-flash",
+  "CLAUDE_MEM_PROVIDER": "openrouter",
+  "CLAUDE_MEM_OPENROUTER_API_KEY": "sk-or-v1-...",
+  "CLAUDE_MEM_OPENROUTER_MODEL": "xiaomi/mimo-v2-flash:free",
   "CLAUDE_MEM_MODE": "code",
   "CLAUDE_MEM_CONTEXT_OBSERVATIONS": "50",
   "CLAUDE_MEM_CONTEXT_SESSION_COUNT": "10",
+  "CLAUDE_MEM_CONTEXT_OBSERVATION_TYPES": "bugfix,decision,discovery",
+  "CLAUDE_MEM_CONTEXT_OBSERVATION_CONCEPTS": "how-it-works,gotcha",
   "CLAUDE_MEM_CONTEXT_FULL_COUNT": "5",
+  "CLAUDE_MEM_CONTEXT_FULL_FIELD": "narrative",
   "CLAUDE_MEM_SKIP_TOOLS": "memory_search,memory_timeline,memory_get_observations"
 }
 ```
 
-Provider selection is OMP-native: use an OMP model reference (`current`, canonical ID, or `provider/model-id`) rather than Claude Code's original `CLAUDE_MEM_PROVIDER` worker setting.
+### Claude-mem setting alignment
+
+| Claude-mem setting | omp-mem status | Reason |
+|---|---|---|
+| `CLAUDE_MEM_MODE` | `mode` | Same concept. |
+| `CLAUDE_MEM_CONTEXT_OBSERVATIONS` | `context.observations` | Same range goal, used for injected index size. |
+| `CLAUDE_MEM_CONTEXT_SESSION_COUNT` | `context.sessions` | Same concept, used for recent summaries. |
+| `CLAUDE_MEM_CONTEXT_OBSERVATION_TYPES` | `context.types` | Supported for context filtering. |
+| `CLAUDE_MEM_CONTEXT_OBSERVATION_CONCEPTS` | `context.concepts` | Supported for context filtering against extracted concepts. |
+| `CLAUDE_MEM_CONTEXT_FULL_COUNT` | `context.fullCount` | Supported for expanded observations. |
+| `CLAUDE_MEM_CONTEXT_FULL_FIELD` | `context.fullField` | Supports `narrative` and `facts`. |
+| `CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY` | `context.includeSummary` | Supported through generated `memory_summary.md` plus recent session summaries. |
+| `CLAUDE_MEM_DATA_DIR` | `dataDir` | Supported but defaults to OMP-owned `~/.omp/agent/omp-mem`. |
+| `CLAUDE_MEM_SKIP_TOOLS` | `capture.skipTools` | Supported with OMP tool names. |
+| `CLAUDE_MEM_PROVIDER` / provider model keys | `ai.source`, `ai.omp`, `ai.direct` | Split because OMP itself already has provider/model configuration. Direct mode covers explicit base URL/API key/model. |
+| Worker host/port, MCP server, Python/chroma, Claude Code path, hook timeouts | intentionally omitted | OMP extension runs in-process and exposes tools through OMP; no separate worker, Chroma daemon, Claude Code hook installer, or MCP server is required. |
+| Web UI/version channel/folder `CLAUDE.md` generation | intentionally omitted | User requested no Web UI; `omp-mem` keeps memory files plugin-owned and avoids writing project folder context files. |
+| Token economics display toggles and last-message injection | intentionally omitted for now | Current store does not persist read/work token economics or raw final-message artifacts as first-class context fields. |
+
+`omp-mem` adds OMP-specific knobs not present in claude-mem: `enabled`, capture hook toggles, artifact write toggles, search result caps, private-tag redaction toggle, and optional retention pruning. These exist because OMP extensions can be enabled/disabled and can inject/write artifacts without a separate worker UI.
 
 ## Tools
 
@@ -136,41 +183,31 @@ Common parameters:
 
 ## Install
 
-### Local development
+Clone the repository directly into the OMP user extension directory:
 
 ```bash
-omp plugin link C:/Users/Anton/.omp/agent/extensions/omp-mem
+mkdir -p ~/.omp/agent/extensions
+cd ~/.omp/agent/extensions
+git clone git@github.com:anton1615/omp-mem.git
+cd omp-mem
+bun install --production
 ```
 
-If OMP is already running, restart it after linking or updating the extension.
-
-### Explicit extension path
-
-You can also load the extension directly:
+On this Windows workstation, the equivalent target path is:
 
 ```bash
-omp --extension C:/Users/Anton/.omp/agent/extensions/omp-mem/index.ts
+C:/Users/Anton/.omp/agent/extensions/omp-mem
 ```
 
-Or add the plugin root to your OMP settings extension paths.
-
-### Marketplace install
-
-This repository is intended to be both the plugin repo root and the marketplace repo root.
-
-Add the GitHub repo as a marketplace:
+If the repository already exists, update it in place:
 
 ```bash
-omp plugin marketplace add anton1615/omp-mem
+cd ~/.omp/agent/extensions/omp-mem
+git pull --ff-only
+bun install --production
 ```
 
-Install the plugin from that marketplace:
-
-```bash
-omp plugin install omp-mem@omp-mem
-```
-
-If your current OMP build does not auto-load extension modules installed from marketplace/plugin roots, use `omp plugin link` or an explicit `--extension` path and restart OMP.
+Restart OMP after cloning or updating the extension so the extension manifest is reloaded.
 
 ## Development
 
@@ -188,10 +225,7 @@ bunx --package typescript tsc --noEmit
 
 ## Repository layout
 
-This repo is intentionally both:
-
-- the plugin repo root, and
-- the marketplace repo root.
+This repo is intentionally the OMP extension package root. Clone it directly under `~/.omp/agent/extensions/`.
 
 Relevant files:
 
@@ -200,7 +234,6 @@ Relevant files:
 - `src/extension.ts` — OMP adapter: lifecycle hooks, tools, and `/mem` command
 - `src/service.ts` — SQLite-backed memory service and response formatting
 - `test/` — service and extension behavior tests
-- `.claude-plugin/marketplace.json` — marketplace catalog pointing to `./`
 
 ## Operational notes
 

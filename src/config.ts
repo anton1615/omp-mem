@@ -2,7 +2,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-export type OmpMemAiProvider = "omp" | "heuristic";
+export type OmpMemAiSource = "omp" | "direct" | "heuristic";
+export type OmpMemDirectApi = "openai-chat";
+export type OmpMemFullField = "narrative" | "facts";
 
 export interface OmpMemConfig {
   enabled: boolean;
@@ -16,16 +18,30 @@ export interface OmpMemConfig {
     skipTools: string[];
   };
   ai: {
-    provider: OmpMemAiProvider;
-    model: string;
+    source: OmpMemAiSource;
     maxTokens: number;
     failOpen: boolean;
+    omp: {
+      provider: string;
+      model: string;
+    };
+    direct: {
+      api: OmpMemDirectApi;
+      baseUrl?: string;
+      apiKey?: string;
+      apiKeyEnv?: string;
+      model?: string;
+      headers: Record<string, string>;
+    };
   };
   context: {
     enabled: boolean;
     observations: number;
     sessions: number;
+    types: string[];
+    concepts: string[];
     fullCount: number;
+    fullField: OmpMemFullField;
     includeSummary: boolean;
   };
   artifacts: {
@@ -51,13 +67,13 @@ export type OmpMemConfigInput = Partial<{
   enabled: unknown;
   dataDir: unknown;
   mode: unknown;
-  capture: Partial<Record<keyof OmpMemConfig["capture"], unknown>>;
-  ai: Partial<Record<keyof OmpMemConfig["ai"], unknown>>;
-  context: Partial<Record<keyof OmpMemConfig["context"], unknown>>;
-  artifacts: Partial<Record<keyof OmpMemConfig["artifacts"], unknown>>;
-  search: Partial<Record<keyof OmpMemConfig["search"], unknown>>;
-  redaction: Partial<Record<keyof OmpMemConfig["redaction"], unknown>>;
-  retention: Partial<Record<keyof OmpMemConfig["retention"], unknown>>;
+  capture: Record<string, unknown>;
+  ai: Record<string, unknown>;
+  context: Record<string, unknown>;
+  artifacts: Record<string, unknown>;
+  search: Record<string, unknown>;
+  redaction: Record<string, unknown>;
+  retention: Record<string, unknown>;
 }>;
 
 export const DEFAULT_OMP_MEM_CONFIG: OmpMemConfig = Object.freeze({
@@ -77,16 +93,27 @@ export const DEFAULT_OMP_MEM_CONFIG: OmpMemConfig = Object.freeze({
     ]) as string[],
   }),
   ai: Object.freeze({
-    provider: "omp",
-    model: "current",
+    source: "omp",
     maxTokens: 1024,
     failOpen: true,
+    omp: Object.freeze({
+      provider: "current",
+      model: "current",
+    }),
+    direct: Object.freeze({
+      api: "openai-chat",
+      apiKeyEnv: "OMP_MEM_DIRECT_API_KEY",
+      headers: Object.freeze({}) as Record<string, string>,
+    }),
   }),
   context: Object.freeze({
     enabled: true,
     observations: 50,
     sessions: 10,
+    types: [] as string[],
+    concepts: [] as string[],
     fullCount: 5,
+    fullField: "narrative",
     includeSummary: true,
   }),
   artifacts: Object.freeze({
@@ -107,8 +134,6 @@ export const DEFAULT_OMP_MEM_CONFIG: OmpMemConfig = Object.freeze({
     pruneDays: null,
   }),
 });
-
-const THINKING_SUFFIXES = new Set(["off", "none", "minimal", "low", "medium", "high", "xhigh"]);
 
 export async function loadOmpMemConfigFromHome(homeDir = os.homedir()): Promise<OmpMemConfig> {
   const agentConfig = await readYamlObject(path.join(homeDir, ".omp", "agent", "config.yml"));
@@ -135,6 +160,10 @@ export function resolveOmpMemConfig(input: OmpMemConfigInput = {}): OmpMemConfig
   const retention = getObject(input.retention) ?? {};
 
   const maxLimit = boundedInteger(search.maxLimit, DEFAULT_OMP_MEM_CONFIG.search.maxLimit, 1, 200);
+  const source = optionalAiSource(ai.source, optionalAiSource(ai.provider, DEFAULT_OMP_MEM_CONFIG.ai.source));
+  const legacyModel = optionalString(ai.model);
+  const omp = resolveOmpModelConfig(getObject(ai.omp), legacyModel);
+  const direct = resolveDirectModelConfig(getObject(ai.direct), ai, source, legacyModel);
 
   return {
     enabled: optionalBoolean(input.enabled, DEFAULT_OMP_MEM_CONFIG.enabled),
@@ -145,19 +174,23 @@ export function resolveOmpMemConfig(input: OmpMemConfigInput = {}): OmpMemConfig
       tools: optionalBoolean(capture.tools, DEFAULT_OMP_MEM_CONFIG.capture.tools),
       agentEnd: optionalBoolean(capture.agentEnd, DEFAULT_OMP_MEM_CONFIG.capture.agentEnd),
       sessionCompact: optionalBoolean(capture.sessionCompact, DEFAULT_OMP_MEM_CONFIG.capture.sessionCompact),
-      skipTools: optionalStringArray(capture.skipTools) ?? [...DEFAULT_OMP_MEM_CONFIG.capture.skipTools],
+      skipTools: optionalStringList(capture.skipTools) ?? [...DEFAULT_OMP_MEM_CONFIG.capture.skipTools],
     },
     ai: {
-      provider: optionalProvider(ai.provider, DEFAULT_OMP_MEM_CONFIG.ai.provider),
-      model: normalizeModelReference(optionalString(ai.model) ?? DEFAULT_OMP_MEM_CONFIG.ai.model),
+      source,
       maxTokens: positiveIntegerOrFallback(ai.maxTokens, DEFAULT_OMP_MEM_CONFIG.ai.maxTokens, 16_384),
       failOpen: optionalBoolean(ai.failOpen, DEFAULT_OMP_MEM_CONFIG.ai.failOpen),
+      omp,
+      direct,
     },
     context: {
       enabled: optionalBoolean(context.enabled, DEFAULT_OMP_MEM_CONFIG.context.enabled),
       observations: boundedInteger(context.observations, DEFAULT_OMP_MEM_CONFIG.context.observations, 1, 200),
       sessions: boundedInteger(context.sessions, DEFAULT_OMP_MEM_CONFIG.context.sessions, 1, 100),
+      types: optionalStringList(context.types ?? context.observationTypes) ?? [...DEFAULT_OMP_MEM_CONFIG.context.types],
+      concepts: optionalStringList(context.concepts ?? context.observationConcepts) ?? [...DEFAULT_OMP_MEM_CONFIG.context.concepts],
       fullCount: boundedInteger(context.fullCount, DEFAULT_OMP_MEM_CONFIG.context.fullCount, 0, 50),
+      fullField: optionalFullField(context.fullField, DEFAULT_OMP_MEM_CONFIG.context.fullField),
       includeSummary: optionalBoolean(context.includeSummary, DEFAULT_OMP_MEM_CONFIG.context.includeSummary),
     },
     artifacts: {
@@ -181,10 +214,7 @@ export function resolveOmpMemConfig(input: OmpMemConfigInput = {}): OmpMemConfig
 }
 
 export function resolveDataDir(homeDir: string, configured?: string): string {
-  if (!configured) {
-    return path.join(homeDir, ".omp", "agent", "omp-mem");
-  }
-  if (configured === "auto") {
+  if (!configured || configured === "auto") {
     return path.join(homeDir, ".omp", "agent", "omp-mem");
   }
   if (configured.startsWith("~/") || configured.startsWith("~\\")) {
@@ -193,22 +223,64 @@ export function resolveDataDir(homeDir: string, configured?: string): string {
   return path.resolve(configured);
 }
 
+function resolveOmpModelConfig(input: Record<string, unknown> | undefined, legacyModel: string | undefined): OmpMemConfig["ai"]["omp"] {
+  if (input) {
+    return {
+      provider: optionalString(input.provider) ?? DEFAULT_OMP_MEM_CONFIG.ai.omp.provider,
+      model: optionalString(input.model ?? input.modelName) ?? DEFAULT_OMP_MEM_CONFIG.ai.omp.model,
+    };
+  }
+  if (legacyModel) {
+    return splitOmpModelReference(legacyModel);
+  }
+  return { ...DEFAULT_OMP_MEM_CONFIG.ai.omp };
+}
+
+function resolveDirectModelConfig(
+  input: Record<string, unknown> | undefined,
+  ai: Record<string, unknown>,
+  source: OmpMemAiSource,
+  legacyModel: string | undefined,
+): OmpMemConfig["ai"]["direct"] {
+  const direct = input ?? {};
+  const model = optionalString(direct.model ?? direct.modelName ?? ai.modelName) ?? (source === "direct" ? legacyModel : undefined);
+  return {
+    api: optionalDirectApi(direct.api, DEFAULT_OMP_MEM_CONFIG.ai.direct.api),
+    baseUrl: optionalString(direct.baseUrl ?? ai.baseUrl),
+    apiKey: optionalString(direct.apiKey ?? ai.apiKey),
+    apiKeyEnv: optionalString(direct.apiKeyEnv ?? ai.apiKeyEnv) ?? DEFAULT_OMP_MEM_CONFIG.ai.direct.apiKeyEnv,
+    model,
+    headers: sanitizeHeaders(optionalStringRecord(direct.headers ?? ai.headers) ?? DEFAULT_OMP_MEM_CONFIG.ai.direct.headers),
+  };
+}
+
+function splitOmpModelReference(modelRef: string): OmpMemConfig["ai"]["omp"] {
+  if (modelRef === "current") {
+    return { provider: "current", model: "current" };
+  }
+  const slash = modelRef.indexOf("/");
+  if (slash > 0) {
+    return { provider: modelRef.slice(0, slash), model: modelRef.slice(slash + 1) };
+  }
+  return { provider: "current", model: modelRef };
+}
+
 function mapClaudeMemSettings(settings: Record<string, unknown>): OmpMemConfigInput {
+  const provider = optionalString(settings.CLAUDE_MEM_PROVIDER)?.toLowerCase();
   const skipTools = parseCommaList(settings.CLAUDE_MEM_SKIP_TOOLS);
+  const ai = mapClaudeMemAiSettings(provider, settings);
   return {
     dataDir: settings.CLAUDE_MEM_DATA_DIR,
     mode: settings.CLAUDE_MEM_MODE,
     capture: skipTools ? { skipTools } : undefined,
-    ai: {
-      provider: settings.OMP_MEM_AI_PROVIDER,
-      model: settings.OMP_MEM_MODEL ?? settings.CLAUDE_MEM_MODEL,
-      maxTokens: settings.OMP_MEM_AI_MAX_TOKENS,
-      failOpen: settings.OMP_MEM_AI_FAIL_OPEN,
-    },
+    ai,
     context: {
       observations: settings.CLAUDE_MEM_CONTEXT_OBSERVATIONS,
       sessions: settings.CLAUDE_MEM_CONTEXT_SESSION_COUNT,
+      types: settings.CLAUDE_MEM_CONTEXT_OBSERVATION_TYPES,
+      concepts: settings.CLAUDE_MEM_CONTEXT_OBSERVATION_CONCEPTS,
       fullCount: settings.CLAUDE_MEM_CONTEXT_FULL_COUNT,
+      fullField: settings.CLAUDE_MEM_CONTEXT_FULL_FIELD,
       includeSummary: settings.CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY,
     },
     search: {
@@ -217,6 +289,57 @@ function mapClaudeMemSettings(settings: Record<string, unknown>): OmpMemConfigIn
     },
     artifacts: {
       maxObservations: settings.OMP_MEM_ARTIFACT_MAX_OBSERVATIONS,
+    },
+  };
+}
+
+function mapClaudeMemAiSettings(provider: string | undefined, settings: Record<string, unknown>): Record<string, unknown> {
+  if (provider === "openrouter") {
+    return {
+      source: "direct",
+      maxTokens: settings.OMP_MEM_AI_MAX_TOKENS,
+      failOpen: settings.OMP_MEM_AI_FAIL_OPEN,
+      direct: {
+        api: "openai-chat",
+        baseUrl: "https://openrouter.ai/api/v1",
+        apiKey: settings.CLAUDE_MEM_OPENROUTER_API_KEY,
+        apiKeyEnv: "OPENROUTER_API_KEY",
+        model: settings.CLAUDE_MEM_OPENROUTER_MODEL ?? "xiaomi/mimo-v2-flash:free",
+        headers: {
+          "HTTP-Referer": settings.CLAUDE_MEM_OPENROUTER_SITE_URL,
+          "X-Title": settings.CLAUDE_MEM_OPENROUTER_APP_NAME ?? "claude-mem",
+        },
+      },
+    };
+  }
+  if (provider === "gemini") {
+    return {
+      source: "direct",
+      maxTokens: settings.OMP_MEM_AI_MAX_TOKENS,
+      failOpen: settings.OMP_MEM_AI_FAIL_OPEN,
+      direct: {
+        api: "openai-chat",
+        baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+        apiKey: settings.CLAUDE_MEM_GEMINI_API_KEY,
+        apiKeyEnv: "GEMINI_API_KEY",
+        model: settings.CLAUDE_MEM_GEMINI_MODEL ?? "gemini-2.5-flash-lite",
+      },
+    };
+  }
+  return {
+    source: settings.OMP_MEM_AI_SOURCE ?? settings.OMP_MEM_AI_PROVIDER,
+    maxTokens: settings.OMP_MEM_AI_MAX_TOKENS,
+    failOpen: settings.OMP_MEM_AI_FAIL_OPEN,
+    omp: {
+      provider: settings.OMP_MEM_OMP_PROVIDER,
+      model: settings.OMP_MEM_OMP_MODEL ?? settings.OMP_MEM_MODEL ?? settings.CLAUDE_MEM_MODEL,
+    },
+    direct: {
+      api: settings.OMP_MEM_DIRECT_API,
+      baseUrl: settings.OMP_MEM_DIRECT_BASE_URL,
+      apiKey: settings.OMP_MEM_DIRECT_API_KEY,
+      apiKeyEnv: settings.OMP_MEM_DIRECT_API_KEY_ENV,
+      model: settings.OMP_MEM_DIRECT_MODEL,
     },
   };
 }
@@ -254,19 +377,55 @@ function optionalString(value: unknown): string | undefined {
 }
 
 function optionalBoolean(value: unknown, fallback: boolean): boolean {
-  return typeof value === "boolean" ? value : fallback;
-}
-
-function optionalProvider(value: unknown, fallback: OmpMemAiProvider): OmpMemAiProvider {
-  return value === "omp" || value === "heuristic" ? value : fallback;
-}
-
-function optionalStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
   }
-  const result = value.map(item => optionalString(item)).filter((item): item is string => Boolean(item));
-  return result.length > 0 ? result : undefined;
+  return fallback;
+}
+
+function optionalAiSource(value: unknown, fallback: OmpMemAiSource): OmpMemAiSource {
+  return value === "omp" || value === "direct" || value === "heuristic" ? value : fallback;
+}
+
+function optionalDirectApi(value: unknown, fallback: OmpMemDirectApi): OmpMemDirectApi {
+  return value === "openai-chat" ? value : fallback;
+}
+
+function optionalFullField(value: unknown, fallback: OmpMemFullField): OmpMemFullField {
+  return value === "narrative" || value === "facts" ? value : fallback;
+}
+
+function optionalStringList(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) {
+    const result = value.map(item => optionalString(item)).filter((item): item is string => Boolean(item));
+    return result.length > 0 ? result : undefined;
+  }
+  return parseCommaList(value);
+}
+
+function optionalStringRecord(value: unknown): Record<string, string> | undefined {
+  const record = getObject(value);
+  if (!record) return undefined;
+  const result: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(record)) {
+    const normalizedKey = optionalString(key);
+    const normalizedValue = optionalString(entry);
+    if (normalizedKey && normalizedValue) result[normalizedKey] = normalizedValue;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function sanitizeHeaders(headers: Record<string, string>): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    const normalized = key.toLowerCase();
+    if (normalized === "authorization" || normalized === "content-type") continue;
+    result[key] = value;
+  }
+  return result;
 }
 
 function optionalNullableInteger(value: unknown, fallback: number | null, min: number, max: number): number | null {
@@ -292,22 +451,11 @@ function boundedInteger(value: unknown, fallback: number, min: number, max: numb
 }
 
 function parseCommaList(value: unknown): string[] | undefined {
-  if (Array.isArray(value)) {
-    return optionalStringArray(value);
-  }
   if (typeof value !== "string") {
     return undefined;
   }
   const result = value.split(",").map(item => item.trim()).filter(Boolean);
   return result.length > 0 ? result : undefined;
-}
-
-function normalizeModelReference(model: string): string {
-  const separator = model.lastIndexOf(":");
-  if (separator === -1) return model;
-  const suffix = model.slice(separator + 1).toLowerCase();
-  if (!THINKING_SUFFIXES.has(suffix)) return model;
-  return model;
 }
 
 function isNotFound(error: unknown): boolean {

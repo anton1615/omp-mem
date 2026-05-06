@@ -18,11 +18,14 @@ import { loadOmpMemConfigFromHome, resolveDataDir, type OmpMemConfig } from "./c
 
 export interface OmpMemModelRequest {
   kind: "observation" | "session-summary";
+  source: "omp" | "direct";
   model: ModelLike;
   apiKey: string;
   prompt: string;
   maxTokens: number;
   ctx: ExtensionContext;
+  baseUrl?: string;
+  headers?: Record<string, string>;
 }
 
 export interface OmpMemExtensionOptions extends Partial<MemoryServiceOptions> {
@@ -149,8 +152,8 @@ export async function registerOmpMemExtension(pi: ExtensionAPI, options: OmpMemE
       customTitle: ctx.sessionManager?.getSessionName?.(),
     });
     const memoryContext = await service.injectContext({ project, q: prompt, limit: config.context.observations });
-    const systemPrompt = typeof event.systemPrompt === "string" ? event.systemPrompt : "";
-    return memoryContext ? { systemPrompt: `${systemPrompt}\n\n${memoryContext}`.trim() } : { systemPrompt };
+    if (!memoryContext) return undefined;
+    return { systemPrompt: [...normalizeSystemPrompts(event.systemPrompt), memoryContext] };
   });
 
   const recordToolEvent = async (
@@ -374,7 +377,7 @@ async function extractObservationWithModel(
   config: OmpMemConfig,
   options: ModelExtractionOptions,
 ): Promise<ObservationExtractionResult | undefined> {
-  if (config.ai.provider !== "omp") return undefined;
+  if (config.ai.source === "heuristic") return undefined;
   const toolInputText = clampModelText(redactForModel(unknownToText(options.toolInput), config));
   const toolResponseText = clampModelText(redactForModel(unknownToText(options.toolResponse), config));
   const combinedText = [toolInputText, toolResponseText].filter(Boolean).join("\n");
@@ -398,7 +401,7 @@ async function summarizeSessionWithModel(
   options: ModelSessionSummaryOptions,
 ): Promise<string | undefined> {
   const lastAssistantMessage = clampModelText(redactForModel(options.lastAssistantMessage, config).trim());
-  if (config.ai.provider !== "omp" || !lastAssistantMessage) return undefined;
+  if (config.ai.source === "heuristic" || !lastAssistantMessage) return undefined;
   const prompt = `You are omp-mem, a claude-mem-compatible memory worker. Summarize the last assistant response for future memory. Keep only durable facts, decisions, changed files, open blockers, and next steps. Return plain markdown, no preamble.\n\n<assistant_response>\n${lastAssistantMessage}\n</assistant_response>`;
   return completeModelText(ctx, config, "session-summary", prompt, options.completeText, options.logger);
 }
@@ -411,16 +414,10 @@ async function completeModelText(
   injectedCompleteText: ((request: OmpMemModelRequest) => Promise<string>) | undefined,
   logger: ExtensionAPI["logger"] | undefined,
 ): Promise<string | undefined> {
-  const model = selectModel(ctx, config.ai.model);
-  if (!model) {
-    return handleModelExtractionUnavailable(config, logger, "model not available", { model: config.ai.model, kind });
-  }
   try {
-    const apiKey = await ctx.modelRegistry?.getApiKey(model, getContentSessionId(ctx));
-    if (!apiKey) {
-      return handleModelExtractionUnavailable(config, logger, "API key not available", { provider: model.provider, model: model.id, kind });
-    }
-    return await (injectedCompleteText ?? defaultCompleteText)({ kind, model, apiKey, prompt, maxTokens: config.ai.maxTokens, ctx });
+    const request = await buildModelRequest(ctx, config, kind, prompt, logger);
+    if (!request) return undefined;
+    return await (injectedCompleteText ?? defaultCompleteText)(request);
   } catch (error) {
     if (!config.ai.failOpen) throw error;
     logger?.warn?.("omp-mem model extraction failed; falling back to heuristic memory", {
@@ -431,7 +428,64 @@ async function completeModelText(
   }
 }
 
+async function buildModelRequest(
+  ctx: ExtensionContext,
+  config: OmpMemConfig,
+  kind: OmpMemModelRequest["kind"],
+  prompt: string,
+  logger: ExtensionAPI["logger"] | undefined,
+): Promise<OmpMemModelRequest | undefined> {
+  if (config.ai.source === "direct") {
+    const modelName = config.ai.direct.model;
+    const baseUrl = config.ai.direct.baseUrl;
+    const apiKey = resolveDirectApiKey(config);
+    if (!modelName) return handleModelExtractionUnavailable(config, logger, "direct model name not configured", { kind });
+    if (!baseUrl) return handleModelExtractionUnavailable(config, logger, "direct baseUrl not configured", { kind, model: modelName });
+    if (!apiKey) return handleModelExtractionUnavailable(config, logger, "direct API key not configured", { kind, model: modelName });
+    return {
+      kind,
+      source: "direct",
+      model: { provider: "direct", id: modelName, name: modelName, api: config.ai.direct.api },
+      apiKey,
+      prompt,
+      maxTokens: config.ai.maxTokens,
+      ctx,
+      baseUrl,
+      headers: config.ai.direct.headers,
+    };
+  }
+
+  const model = selectOmpModel(ctx, config.ai.omp.provider, config.ai.omp.model);
+  if (!model) {
+    return handleModelExtractionUnavailable(config, logger, "OMP model not available", {
+      provider: config.ai.omp.provider,
+      model: config.ai.omp.model,
+      kind,
+    });
+  }
+  const apiKey = await ctx.modelRegistry?.getApiKey(model, getContentSessionId(ctx));
+  if (!apiKey) {
+    return handleModelExtractionUnavailable(config, logger, "OMP API key not available", { provider: model.provider, model: model.id, kind });
+  }
+  return {
+    kind,
+    source: "omp",
+    model,
+    apiKey,
+    prompt,
+    maxTokens: config.ai.maxTokens,
+    ctx,
+  };
+}
+
+function resolveDirectApiKey(config: OmpMemConfig): string | undefined {
+  return config.ai.direct.apiKey ?? (config.ai.direct.apiKeyEnv ? process.env?.[config.ai.direct.apiKeyEnv] : undefined);
+}
+
 async function defaultCompleteText(request: OmpMemModelRequest): Promise<string> {
+  if (request.source === "direct") {
+    return completeDirectOpenAiText(request);
+  }
   type CompletionResponse = { content: Array<{ type: string; text?: string }> };
   type PiAiModule = {
     complete(
@@ -462,6 +516,36 @@ async function defaultCompleteText(request: OmpMemModelRequest): Promise<string>
     .trim();
 }
 
+async function completeDirectOpenAiText(request: OmpMemModelRequest): Promise<string> {
+  const response = await fetch(toOpenAiChatUrl(request.baseUrl ?? ""), {
+    method: "POST",
+    headers: {
+      ...request.headers,
+      Authorization: `Bearer ${request.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: request.model.id,
+      messages: [{ role: "user", content: request.prompt }],
+      max_tokens: request.maxTokens,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`direct model request failed: HTTP ${response.status} ${await response.text()}`);
+  }
+  const payload = await response.json() as Record<string, unknown>;
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  const first = choices[0] as Record<string, unknown> | undefined;
+  const message = first?.message as Record<string, unknown> | undefined;
+  const content = message?.content;
+  return typeof content === "string" ? content.trim() : "";
+}
+
+function toOpenAiChatUrl(baseUrl: string): string {
+  const trimmed = baseUrl.replace(/\/+$/, "");
+  return trimmed.endsWith("/chat/completions") ? trimmed : `${trimmed}/chat/completions`;
+}
+
 function handleModelExtractionUnavailable(
   config: OmpMemConfig,
   logger: ExtensionAPI["logger"] | undefined,
@@ -473,25 +557,25 @@ function handleModelExtractionUnavailable(
   return undefined;
 }
 
-function selectModel(ctx: ExtensionContext, configuredModel: string): ModelLike | undefined {
-  if (configuredModel === "current") return ctx.model;
+function selectOmpModel(ctx: ExtensionContext, provider: string, modelName: string): ModelLike | undefined {
+  if (provider === "current" && modelName === "current") return ctx.model;
   const registry = ctx.modelRegistry;
   if (!registry) return undefined;
 
-  const canonical = asModelLike(registry.resolveCanonicalModel?.(configuredModel, { availableOnly: true }));
-  if (canonical) return canonical;
-
-  const slashIndex = configuredModel.indexOf("/");
-  if (slashIndex > 0) {
-    const provider = configuredModel.slice(0, slashIndex);
-    const rawModelId = configuredModel.slice(slashIndex + 1);
-    const exact = asModelLike(registry.find?.(provider, rawModelId));
+  if (provider !== "current") {
+    const exact = asModelLike(registry.find?.(provider, modelName));
     if (exact) return exact;
-    const stripped = stripThinkingSuffix(rawModelId);
-    if (stripped !== rawModelId) return asModelLike(registry.find?.(provider, stripped));
+    const stripped = stripThinkingSuffix(modelName);
+    if (stripped !== modelName) return asModelLike(registry.find?.(provider, stripped));
   }
 
-  return registry.getAvailable?.().map(asModelLike).filter((model): model is ModelLike => Boolean(model)).find(model => model.id === configuredModel || `${model.provider}/${model.id}` === configuredModel);
+  const canonical = asModelLike(registry.resolveCanonicalModel?.(modelName, { availableOnly: true }));
+  if (canonical) return canonical;
+
+  return registry.getAvailable?.()
+    .map(asModelLike)
+    .filter((model): model is ModelLike => Boolean(model))
+    .find(model => model.id === modelName || `${model.provider}/${model.id}` === modelName);
 }
 
 function clampModelText(text: string): string {
@@ -564,6 +648,11 @@ function unknownToText(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function normalizeSystemPrompts(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((prompt): prompt is string => typeof prompt === "string" && prompt.length > 0);
+  return typeof value === "string" && value.length > 0 ? [value] : [];
 }
 
 function getContentSessionId(ctx: ExtensionContext): string {

@@ -177,6 +177,93 @@ test("context injection uses configured session summaries and full observation d
   expect(context).toContain("Alpha durable detail in src/alpha.ts");
 });
 
+test("context injection honors observation type concept filters and full field", async () => {
+  const service = await createTrackedService({
+    memoryRoot: tempRoot,
+    now: () => 1_700_000_000,
+    config: resolveOmpMemConfig({
+      context: {
+        observations: 10,
+        types: ["decision"],
+        concepts: ["alpha"],
+        fullCount: 1,
+        fullField: "facts",
+      },
+    }),
+    extractObservation: async request => request.toolResponseText.includes("alpha")
+      ? {
+        title: "Alpha decision",
+        narrative: "Alpha narrative should stay compact-only.",
+        type: "decision",
+        concepts: ["alpha"],
+        facts: ["Alpha fact expanded from facts field."],
+      }
+      : {
+        title: "Beta feature",
+        narrative: "Beta narrative should be filtered out.",
+        type: "feature",
+        concepts: ["beta"],
+        facts: ["Beta fact"],
+      },
+  });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Filter context" });
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-alpha", tool_response: "alpha" }));
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-beta", tool_response: "beta" }));
+
+  const context = await service.injectContext({ project: "app" });
+
+  expect(context).toContain("Alpha decision");
+  expect(context).toContain("Alpha fact expanded from facts field.");
+  expect(context).not.toContain("Alpha narrative should stay compact-only.");
+  expect(context).not.toContain("Beta feature");
+});
+
+test("context filters are applied before final observation limit", async () => {
+  const service = await createTrackedService({
+    memoryRoot: tempRoot,
+    now: (() => {
+      let current = 1_700_000_000;
+      return () => current++;
+    })(),
+    config: resolveOmpMemConfig({ context: { observations: 1, types: ["decision"], fullCount: 0 } }),
+    extractObservation: async request => request.toolResponseText.includes("decision")
+      ? { title: "Older decision", narrative: "Decision detail", type: "decision", concepts: ["architecture"] }
+      : { title: "Newer feature", narrative: "Feature detail", type: "feature", concepts: ["ui"] },
+  });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Filter context" });
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-decision", tool_response: "decision" }));
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-feature", tool_response: "feature" }));
+
+  const context = await service.injectContext({ project: "app" });
+
+  expect(context).toContain("Older decision");
+  expect(context).not.toContain("Newer feature");
+});
+
+test("context filters can reach older matching observations beyond candidate window", async () => {
+  const service = await createTrackedService({
+    memoryRoot: tempRoot,
+    now: (() => {
+      let current = 1_700_000_000;
+      return () => current++;
+    })(),
+    config: resolveOmpMemConfig({ context: { observations: 1, concepts: ["target"], fullCount: 0 } }),
+    extractObservation: async request => request.toolResponseText.includes("target")
+      ? { title: "Older target memory", narrative: "Target detail", type: "decision", concepts: ["target"] }
+      : { title: "Newer noise", narrative: "Noise detail", type: "feature", concepts: ["noise"] },
+  });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Filter context" });
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-target", tool_response: "target" }));
+  for (let index = 0; index < 11; index += 1) {
+    await service.recordObservation(makeObservation({ tool_use_id: `tool-noise-${index}`, tool_response: `noise ${index}` }));
+  }
+
+  const context = await service.injectContext({ project: "app" });
+
+  expect(context).toContain("Older target memory");
+  expect(context).not.toContain("Newer noise");
+});
+
 test("recordObservation prefers configured model extraction over heuristic fields", async () => {
   const service = await createTrackedService({
     memoryRoot: tempRoot,
@@ -265,6 +352,27 @@ test("flushArtifacts honors artifact max above public search cap", async () => {
   expect(full).toContain("First artifact detail");
   expect(full).toContain("Second artifact detail");
   expect(full).toContain("Third artifact detail");
+});
+
+test("retention maxObservations prunes oldest project observations", async () => {
+  const service = await createTrackedService({
+    memoryRoot: tempRoot,
+    now: (() => {
+      let current = 1_700_000_000;
+      return () => current++;
+    })(),
+    config: resolveOmpMemConfig({ retention: { maxObservations: 2 } }),
+  });
+  await service.initSession({ contentSessionId: "session-1", project: "app", prompt: "Work" });
+  await service.recordObservation(makeObservation({ tool_use_id: "tool-1", tool_response: "First retained detail" }));
+  const second = await service.recordObservation(makeObservation({ tool_use_id: "tool-2", tool_response: "Second retained detail" }));
+  const third = await service.recordObservation(makeObservation({ tool_use_id: "tool-3", tool_response: "Third retained detail" }));
+
+  const search = await service.search({ project: "app", limit: 10, orderBy: "date_asc" });
+  const firstSearch = await service.search({ project: "app", query: "First", limit: 10 });
+
+  expect(search.results.map(result => result.id)).toEqual([second, third]);
+  expect(firstSearch.results).toEqual([]);
 });
 
 test("summarizeSession uses configured model summary and falls back safely", async () => {

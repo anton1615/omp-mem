@@ -106,7 +106,7 @@ test("captures OMP prompt and tool_execution_end events then exposes progressive
   expect(beforeAgentStart).toBeDefined();
   expect(toolExecutionEnd).toBeDefined();
 
-  const beforeResult = await beforeAgentStart?.({ type: "before_agent_start", prompt: "Fix JWT auth", systemPrompt: "base prompt" }, ctx);
+  const beforeResult = await beforeAgentStart?.({ type: "before_agent_start", prompt: "Fix JWT auth", systemPrompt: ["base prompt"] }, ctx);
   await toolExecutionEnd?.({
     type: "tool_execution_end",
     toolCallId: "tool-1",
@@ -123,11 +123,32 @@ test("captures OMP prompt and tool_execution_end events then exposes progressive
   const search = await searchTool?.execute("call-1", { query: "JWT auth", project: "app" }, undefined, ctx);
   const details = await getTool?.execute("call-2", { ids: [1] }, undefined, ctx);
 
-  expect((beforeResult as { systemPrompt?: string }).systemPrompt).toContain("base prompt");
-  expect((beforeResult as { systemPrompt?: string }).systemPrompt).toContain("Memory Guidance");
+  const beforeSystemPrompt = (beforeResult as { systemPrompt?: unknown }).systemPrompt;
+  expect(Array.isArray(beforeSystemPrompt)).toBe(true);
+  expect((beforeSystemPrompt as string[])[0]).toBe("base prompt");
+  expect((beforeSystemPrompt as string[]).join("\n\n")).toContain("Memory Guidance");
   expect(search?.content[0]?.text).toContain("#1");
   expect(search?.content[0]?.text).not.toContain("regression in src/auth.ts\n");
   expect(details?.content[0]?.text).toContain("Fixed JWT auth regression");
+});
+
+test("before_agent_start does not return legacy string systemPrompt when context is disabled", async () => {
+  const fake = createFakeApi();
+  const ctx = createContext();
+  await registerOmpMemExtension(fake.api, {
+    memoryRoot: tempRoot,
+    dbPath: ":memory:",
+    now: () => 1_700_000_000,
+    config: resolveOmpMemConfig({ context: { enabled: false } }),
+  });
+
+  const beforeResult = await fake.handlers.get("before_agent_start")?.[0]?.({
+    type: "before_agent_start",
+    prompt: "No injected memory",
+    systemPrompt: ["base prompt"],
+  }, ctx);
+
+  expect(beforeResult).toBe(undefined);
 });
 
 test("deduplicates tool_execution_end and tool_result for the same tool call", async () => {
@@ -135,7 +156,7 @@ test("deduplicates tool_execution_end and tool_result for the same tool call", a
   const ctx = createContext();
   await registerOmpMemExtension(fake.api, { memoryRoot: tempRoot, dbPath: ":memory:", now: () => 1_700_000_000 });
 
-  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Fix JWT auth", systemPrompt: "base prompt" }, ctx);
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Fix JWT auth", systemPrompt: ["base prompt"] }, ctx);
   await fake.handlers.get("tool_execution_end")?.[0]?.({
     type: "tool_execution_end",
     toolCallId: "tool-1",
@@ -180,7 +201,7 @@ test("uses configured OMP model extraction for captured tool observations", asyn
     },
   });
 
-  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Check model extraction", systemPrompt: "base" }, ctx);
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Check model extraction", systemPrompt: ["base"] }, ctx);
   await fake.handlers.get("tool_execution_end")?.[0]?.({
     type: "tool_execution_end",
     toolCallId: "tool-model",
@@ -193,6 +214,86 @@ test("uses configured OMP model extraction for captured tool observations", asyn
 
   expect(details?.content[0]?.text).toContain("Model extracted hook observation");
   expect(details?.content[0]?.text).toContain("model extraction ran");
+});
+
+test("uses configured OMP provider and model name instead of current model shorthand", async () => {
+  const fake = createFakeApi();
+  const ctx = createContext(true);
+  ctx.modelRegistry = {
+    getApiKey: async model => {
+      expect((model as { provider: string }).provider).toBe("cliproxyapi");
+      return "registry-key";
+    },
+    find: (provider, modelId) => ({ provider, id: modelId, name: modelId, api: "openai-responses" }),
+    getAvailable: () => [],
+  };
+  await registerOmpMemExtension(fake.api, {
+    memoryRoot: tempRoot,
+    dbPath: ":memory:",
+    now: () => 1_700_000_000,
+    config: resolveOmpMemConfig({ ai: { source: "omp", omp: { provider: "cliproxyapi", model: "memory-model" } } }),
+    completeText: async request => {
+      expect(request.source).toBe("omp");
+      expect(request.model.provider).toBe("cliproxyapi");
+      expect(request.model.id).toBe("memory-model");
+      expect(request.apiKey).toBe("registry-key");
+      return JSON.stringify({ title: "Configured OMP model", narrative: "Configured OMP model ran." });
+    },
+  });
+
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Use configured model", systemPrompt: ["base"] }, ctx);
+  await fake.handlers.get("tool_execution_end")?.[0]?.({
+    type: "tool_execution_end",
+    toolCallId: "tool-configured-model",
+    toolName: "bash",
+    result: "configured model output",
+    isError: false,
+  }, ctx);
+
+  const details = await fake.tools.get("memory_get_observations")?.execute("call-configured-model", { ids: [1] }, undefined, ctx);
+  expect(details?.content[0]?.text).toContain("Configured OMP model");
+});
+
+test("uses direct OpenAI-compatible model config without OMP registry", async () => {
+  const fake = createFakeApi();
+  const ctx = createContext(false);
+  await registerOmpMemExtension(fake.api, {
+    memoryRoot: tempRoot,
+    dbPath: ":memory:",
+    now: () => 1_700_000_000,
+    config: resolveOmpMemConfig({
+      ai: {
+        source: "direct",
+        direct: {
+          baseUrl: "https://llm.example.test/v1",
+          apiKey: "direct-key",
+          model: "direct-memory-model",
+          headers: { "X-Test": "yes" },
+        },
+      },
+    }),
+    completeText: async request => {
+      expect(request.source).toBe("direct");
+      expect(request.baseUrl).toBe("https://llm.example.test/v1");
+      expect(request.apiKey).toBe("direct-key");
+      expect(request.model.provider).toBe("direct");
+      expect(request.model.id).toBe("direct-memory-model");
+      expect(request.headers).toEqual({ "X-Test": "yes" });
+      return JSON.stringify({ title: "Direct model", narrative: "Direct model ran." });
+    },
+  });
+
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Use direct model", systemPrompt: ["base"] }, ctx);
+  await fake.handlers.get("tool_execution_end")?.[0]?.({
+    type: "tool_execution_end",
+    toolCallId: "tool-direct-model",
+    toolName: "bash",
+    result: "direct model output",
+    isError: false,
+  }, ctx);
+
+  const details = await fake.tools.get("memory_get_observations")?.execute("call-direct-model", { ids: [1] }, undefined, ctx);
+  expect(details?.content[0]?.text).toContain("Direct model");
 });
 
 test("redacts private spans before model extraction", async () => {
@@ -215,7 +316,7 @@ test("redacts private spans before model extraction", async () => {
     },
   });
 
-  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Check redaction", systemPrompt: "base" }, ctx);
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Check redaction", systemPrompt: ["base"] }, ctx);
   await fake.handlers.get("tool_execution_end")?.[0]?.({
     type: "tool_execution_end",
     toolCallId: "tool-private",
@@ -251,7 +352,7 @@ test("clamps tool output before model extraction prompt", async () => {
     },
   });
 
-  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Clamp", systemPrompt: "base" }, ctx);
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Clamp", systemPrompt: ["base"] }, ctx);
   await fake.handlers.get("tool_execution_end")?.[0]?.({
     type: "tool_execution_end",
     toolCallId: "tool-large",
@@ -280,7 +381,7 @@ test("clamps session summary before model prompt", async () => {
     },
   });
 
-  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Clamp summary", systemPrompt: "base" }, ctx);
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Clamp summary", systemPrompt: ["base"] }, ctx);
   await fake.handlers.get("agent_end")?.[0]?.({
     type: "agent_end",
     messages: [{ content: `${"x".repeat(9_000)}TAIL_MARKER` }],
@@ -306,7 +407,7 @@ test("falls back when model API key lookup fails open", async () => {
     },
   });
 
-  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Fallback", systemPrompt: "base" }, ctx);
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Fallback", systemPrompt: ["base"] }, ctx);
   await fake.handlers.get("tool_execution_end")?.[0]?.({
     type: "tool_execution_end",
     toolCallId: "tool-fallback",
@@ -330,7 +431,7 @@ test("throws when model lookup fails closed", async () => {
     config: resolveOmpMemConfig({ ai: { provider: "omp", model: "current", failOpen: false } }),
   });
 
-  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Fail closed", systemPrompt: "base" }, ctx);
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Fail closed", systemPrompt: ["base"] }, ctx);
   let message = "";
   try {
     await fake.handlers.get("tool_execution_end")?.[0]?.({
@@ -361,7 +462,7 @@ test("throws when API key lookup returns empty and failOpen is false", async () 
     config: resolveOmpMemConfig({ ai: { provider: "omp", model: "current", failOpen: false } }),
   });
 
-  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Fail closed key", systemPrompt: "base" }, ctx);
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Fail closed key", systemPrompt: ["base"] }, ctx);
   let message = "";
   try {
     await fake.handlers.get("tool_execution_end")?.[0]?.({
@@ -388,7 +489,7 @@ test("respects configured skipped tools", async () => {
     config: resolveOmpMemConfig({ capture: { skipTools: ["bash"] } }),
   });
 
-  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Skip bash", systemPrompt: "base" }, ctx);
+  await fake.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "Skip bash", systemPrompt: ["base"] }, ctx);
   await fake.handlers.get("tool_execution_end")?.[0]?.({
     type: "tool_execution_end",
     toolCallId: "tool-skip",
