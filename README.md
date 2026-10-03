@@ -1,8 +1,31 @@
 # omp-mem
 
+> [!WARNING]
+> **Unmaintained — retired on 2026-10-03.**
+> Superseded by the memory subsystem built into OMP 18.5; switch to `memory.backend` and the built-in `recall`/`retain`/`reflect`/`memory_edit` tools. See [Why this extension was retired](#why-this-extension-was-retired).
+
 Claude-mem-compatible replacement memory extension for Oh My Pi / OMP.
 
 `omp-mem` records OMP session context, prompts, tool observations, compact events, manual memories, and session summaries into a project-scoped SQLite store. It exposes the familiar progressive memory workflow through `memory_search`, `memory_timeline`, and `memory_get_observations`, adds `memory_remember` for explicit saves, then injects a compact memory summary into future agent turns.
+
+## Why this extension was retired
+
+OMP 18.5 ships a complete memory subsystem that covers what this extension provided, so the two now overlap instead of complementing each other:
+
+- **Built-in memory backends replace the plugin.** The `memory.backend` setting selects `off | local | hindsight | mnemopi | sharpshooter` (`src/memory-backend/settings.ts:13-45`), and the built-in tools `retain`, `recall`, `reflect`, `memory_edit`, and `learn` are registered under it (`src/memory-backend/tool-names.ts:4`) and gated per backend in `src/tools/index.ts:782-791`. See OMP's `memory.md` and `mnemosyne-memory-backend.md` documentation.
+- **The registered tool surface overlaps the built-ins.** `memory_search`, `memory_timeline`, `memory_get_observations`, and `memory_remember` duplicate capabilities now served by OMP's native `recall`, `retain`, and `memory_edit`, which makes the extension redundant rather than necessary.
+- **The extension tool API is incompatible with OMP 18.5.** Tools are now invoked as `execute(toolCallId, params, signal, onUpdate, ctx)` (`src/extensibility/extensions/types.ts:705-712`, call site `src/extensibility/extensions/wrapper.ts:116-130`), while this extension still declares the older order `(toolCallId, params, onUpdate, ctx, signal)` (`src/extension.ts:94-99`). The `ctx` parameter therefore receives the `onUpdate` callback: session attribution degrades to `unknown-session` (`src/extension.ts:695`) and the working directory falls back to `process.cwd()`.
+- **No crash, but incorrect behavior.** The mismatch does not throw; it silently produces wrong session and cwd context, so re-enabling the extension would require code changes rather than configuration.
+- **Already disabled.** On the reference workstation it is turned off through `~/.omp/agent/config.yml` via `disabledExtensions: [extension-module:omp-mem]`.
+
+### Migration
+
+Use OMP's built-in memory instead of this extension:
+
+- Set the `memory.backend` key in `~/.omp/agent/config.yml`. `memory.backend: mnemopi` is the closest match to this extension's local SQLite store and provides the `recall`, `retain`, `reflect`, and `memory_edit` tools.
+- Other backends: `local` for the rollout-summary pipeline (`memory_summary.md`), `hindsight` for the remote vector memory service, and `sharpshooter` for friction-gated project decision files.
+- Because the plugin is retired, keep `extension-module:omp-mem` under `disabledExtensions` and rely on the configured backend.
+- See OMP's `memory.md` and `mnemosyne-memory-backend.md` documentation for backend-specific setup.
 
 ## Compatibility
 
